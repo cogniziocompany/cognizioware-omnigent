@@ -194,4 +194,5 @@ def register_elicitations_routes(
             "phase": params.get("phase", ""),
             "policy_name": params.get("policy_name", ""),
             "content_preview": params.get("content_preview", ""),
+            "requestedSchema": params.get("requestedSchema", {}),
         }
