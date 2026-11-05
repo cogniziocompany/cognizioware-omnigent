@@ -50,7 +50,7 @@ env:
 
 jobs:
   prioritize:
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, lan-cognizioware]
     timeout-minutes: 10
     env:
       UV_INDEX_URL: https://pypi.org/simple
@@ -147,7 +147,7 @@ jobs:
     # fails after labeling. A separate job keeps PR write access out of grading.
     needs: prioritize
     if: ${{ !cancelled() && inputs.apply && vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, lan-cognizioware]
     timeout-minutes: 5
     permissions:
       contents: read

@@ -18,12 +18,13 @@ on:
   workflow_call:
     inputs:
       runner:
-        # Runner label for this gate job. Defaults to the standard pool; the
-        # heavy workflows (ci/e2e/e2e-ui) pass a larger-runner label so the gate
-        # -- the mandatory first job every dependent CI job `needs` -- is not
-        # throttled behind a saturated standard pool.
+        # Runner labels for this gate job, as a JSON array string parsed by
+        # fromJSON below. Defaults to the self-hosted pool; the heavy workflows
+        # (ci/e2e/e2e-ui) pass a larger-runner label so the gate -- the
+        # mandatory first job every dependent CI job `needs` -- is not throttled
+        # behind a saturated pool.
         type: string
-        default: ubuntu-24.04
+        default: '["self-hosted", "lan-cognizioware"]'
         required: false
 
 permissions:
@@ -33,7 +34,7 @@ permissions:
 jobs:
   gate:
     name: Security Gate
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ fromJSON(inputs.runner) }}
     timeout-minutes: 12
     steps:
       - name: Check out trust check from main
