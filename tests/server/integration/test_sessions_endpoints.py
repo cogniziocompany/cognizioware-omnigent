@@ -4285,6 +4285,86 @@ async def test_patch_session_external_session_id_rejects_overwrite(
     assert after.json()["external_session_id"] == "sid-1"
 
 
+async def test_patch_session_external_session_id_null_unlinks_a_lost_native_session(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    Explicit null unlinks an idle session so the replacement id can be recorded.
+
+    A runtime that lost its native session creates a new one and PATCHes the
+    new id; the overwrite guard would reject it while the stale id is still
+    set. Null is the sanctioned reconcile: the caller confirms the native
+    session is gone, the server clears, and the replacement then lands.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"external_session_id": "sid-gone"},
+    )
+
+    unlink = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={
+            "external_session_id": None,
+            "external_session_id_native_gone": True,
+        },
+    )
+    assert unlink.status_code == 200, unlink.text
+    assert unlink.json()["external_session_id"] is None
+
+    relink = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"external_session_id": "sid-new"},
+    )
+    assert relink.status_code == 200, relink.text
+    assert relink.json()["external_session_id"] == "sid-new"
+
+
+async def test_patch_session_external_session_id_null_refused_while_a_turn_runs(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A live turn still writes into the old session, so the unlink is refused."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"external_session_id": "sid-gone"},
+    )
+    SqlAlchemyConversationStore(db_uri).set_session_live_status(session["id"], "running")
+
+    resp = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={
+            "external_session_id": None,
+            "external_session_id_native_gone": True,
+        },
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "conflict"
+    after = await client.get(f"/v1/sessions/{session['id']}")
+    assert after.json()["external_session_id"] == "sid-gone"
+
+
+async def test_patch_session_external_session_id_null_requires_the_gone_confirmation(
+    client: httpx.AsyncClient,
+) -> None:
+    """A bare null is ambiguous — omitting the confirmation is a client error."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"external_session_id": None},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+
 async def test_create_session_returns_null_external_session_id(
     client: httpx.AsyncClient,
 ) -> None:

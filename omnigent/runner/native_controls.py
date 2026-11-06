@@ -2060,10 +2060,17 @@ def build_native_controls(
         if _session_harness_name(conv_id) != "opencode-native":
             return Response(status_code=204)
         if server_client is not None:
+            # /clear discards this session's OpenCode session, so the link
+            # must be unlinked before the relaunch records the replacement.
+            # The server refuses while work is still in flight; the relaunch
+            # below then proceeds unpinned rather than blocking the clear.
             with contextlib.suppress(httpx.HTTPError):
                 await server_client.patch(
                     f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}",
-                    json={"external_session_id": None},
+                    json={
+                        "external_session_id": None,
+                        "external_session_id_native_gone": True,
+                    },
                     params={"include_usage": "false"},
                     timeout=10.0,
                 )
