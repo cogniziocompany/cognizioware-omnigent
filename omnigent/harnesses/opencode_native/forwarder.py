@@ -41,6 +41,7 @@ from omnigent.harnesses.opencode_native.permissions import (
     normalize_for_policy,
     parse_permission_request,
 )
+from omnigent.native._native_post_delivery import post_session_event_with_retry
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -77,6 +78,14 @@ _AUTH_STATUS_CODES = frozenset({401, 403})
 
 # Bound the dedupe set so a long-lived session can't grow it without limit.
 _MAX_DEDUPE_KEYS = 8192
+# Native event POST retry policy, matching the codex/antigravity forwarders: a
+# transient gateway error (e.g. Caddy's 502 on the ingestion route) is retried a
+# bounded number of times instead of ending the forwarder; a permanent 4xx is
+# returned at once so its caller still sees the failure.
+_POST_MAX_ATTEMPTS = 3
+_POST_RETRY_DELAY_SECONDS = 0.1
+_POST_RETRY_MAX_DELAY_SECONDS = 30.0
+_POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 # Web status label cap for a retry notice.
 _MAX_BLOCKED_ON_CHARS = 200
 
@@ -461,6 +470,22 @@ def _child_session_id(response: httpx.Response | None) -> str | None:
     return child if isinstance(child, str) and child else None
 
 
+async def _sleep(seconds: float) -> None:
+    """Wait between native event POST attempts (indirection for tests)."""
+    await asyncio.sleep(seconds)
+
+
+def _post_retry_delay(attempt: int) -> float:
+    """
+    Return the capped exponential delay before retrying a native event POST.
+
+    :param attempt: One-based failed attempt number, e.g. ``1``.
+    :returns: Delay in seconds before the next attempt.
+    """
+    exponent = min(max(0, attempt - 1), 32)
+    return min(_POST_RETRY_DELAY_SECONDS * (2**exponent), _POST_RETRY_MAX_DELAY_SECONDS)
+
+
 def _synthetic_event(event_type: str, data: Mapping[str, Any]) -> OpenCodeEvent:
     """Wrap a REST payload as the event that would have carried it live."""
     return OpenCodeEvent(id=None, type=event_type, data=dict(data), location=None)
@@ -693,6 +718,12 @@ class OpenCodeNativeForwarder:
         """
         POST one Omnigent session event.
 
+        Transient failures (5xx such as a gateway's 502, 429, and transport
+        errors) are retried a bounded number of times so a momentary server
+        hiccup cannot end the forwarder. Permanent 4xx responses are returned
+        unretried, so callers depending on the ack (``external_subagent_start``)
+        still see the rejection.
+
         :param event_type: Omnigent event type, e.g. ``"external_session_status"``.
         :param data: Event data payload.
         :param conversation_id: Target conversation; defaults to this session's.
@@ -700,16 +731,17 @@ class OpenCodeNativeForwarder:
         """
         target = conversation_id or self._session_id
         url = f"/v1/sessions/{quote(target, safe='')}/events"
-        try:
-            return await self._server.post(url, json={"type": event_type, "data": data})
-        except httpx.HTTPError:
-            _logger.warning(
-                "OpenCode forwarder failed to post %s for session=%s",
-                event_type,
-                target,
-                exc_info=True,
-            )
-            return None
+        return await post_session_event_with_retry(
+            client=self._server,
+            url=url,
+            payload={"type": event_type, "data": data},
+            event_type=event_type,
+            max_attempts=_POST_MAX_ATTEMPTS,
+            retry_status_codes=_POST_RETRY_STATUS_CODES,
+            sleep=_sleep,
+            retry_delay=_post_retry_delay,
+            logger_name=__name__,
+        )
 
     async def _post_status(
         self, turn: _SessionTurn, status: str, *, extra: _JsonMapping | None = None

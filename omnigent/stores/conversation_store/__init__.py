@@ -2075,6 +2075,57 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def clear_external_session_id_if_qualified(
+        self,
+        conversation_id: str,
+        *,
+        expected: str,
+        native_session_gone: bool,
+    ) -> bool:
+        """
+        Re-link a conversation whose native session no longer exists.
+
+        The overwrite refusal in :meth:`set_external_session_id` keeps a
+        conversation pinned to the runtime session it first observed.
+        When that runtime session is gone (deleted on disk, dropped by a
+        restarted server, never persisted), the pin is stale: the
+        wrapper must record the replacement session id, and the store
+        refuses it. This is the one sanctioned escape hatch, and it
+        clears only under both of these conditions:
+
+        * ``native_session_gone`` — the caller confirmed the native
+          session named by the stored id no longer exists.
+        * no in-flight effects — the conversation has no work still
+          depending on the old runtime session: no pending startup
+          input awaiting delivery, no ``running``/``waiting`` live
+          turn, and no outstanding approval or background shell.
+
+        Clearing mid-turn would let the next write re-point the row at a
+        session the live turn is not writing into, losing that turn's
+        events. Clearing with a queued input would drop the input's
+        context. So those cases leave the row untouched and this method
+        returns ``False``; the caller surfaces the conflict instead.
+
+        Like :meth:`set_external_session_id`, a cleared row is a
+        re-link, not conversation activity, so ``updated_at`` is bumped
+        only when the value actually changes.
+
+        :param conversation_id: Conversation to update, e.g.
+            ``"conv_abc123"``.
+        :param expected: The stored native session id the caller saw.
+            Guards against clearing a value another writer already
+            replaced.
+        :param native_session_gone: ``True`` only when the caller has
+            observed that the native session no longer exists.
+        :returns: ``True`` when the row was cleared; ``False`` when the
+            clear was refused (in-flight effects, a different stored
+            value, or a row that was already unset).
+        :raises ConversationNotFoundError: If no conversation row
+            with ``conversation_id`` exists.
+        """
+        ...
+
+    @abstractmethod
     def create_session_with_agent(
         self,
         *,
