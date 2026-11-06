@@ -2065,6 +2065,67 @@ async def test_full_fixture_turn_replays_consistently() -> None:
     assert stream_ids <= retired, "every live preview is retired by a final item"
 
 
+# --- native event POST retry ------------------------------------------------
+
+
+class _FlakyServerClient:
+    """Server client returning a scripted status per POST, recording attempts."""
+
+    def __init__(self, statuses: list[int]) -> None:
+        self.statuses = statuses
+        self.urls: list[str] = []
+
+    async def post(self, url: str, *, json: dict[str, Any]) -> httpx.Response:
+        self.urls.append(url)
+        status = self.statuses[min(len(self.urls) - 1, len(self.statuses) - 1)]
+        return httpx.Response(status, request=httpx.Request("POST", url))
+
+
+def _record_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Capture retry delays instead of sleeping; returns the recorded delays."""
+    delays: list[float] = []
+
+    async def _record(seconds: float) -> None:
+        delays.append(seconds)
+
+    monkeypatch.setattr(fwd_mod, "_sleep", _record)
+    return delays
+
+
+async def test_post_event_retries_transient_502_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient gateway 502 is retried with capped backoff, not fatal."""
+    server, opencode = _FlakyServerClient([502, 502, 200]), _FakeOpenCodeClient()
+    delays = _record_sleeps(monkeypatch)
+    fwd = _forwarder(server, opencode)  # type: ignore[arg-type]
+
+    response = await fwd._post_event("external_session_status", {"status": "idle"})
+
+    assert response is not None
+    assert response.status_code == 200
+    assert len(server.urls) == 3, "the two transient failures must be retried"
+    assert delays == [fwd_mod._POST_RETRY_DELAY_SECONDS, fwd_mod._POST_RETRY_DELAY_SECONDS * 2]
+    assert all(delay <= fwd_mod._POST_RETRY_MAX_DELAY_SECONDS for delay in delays)
+    assert len(delays) < fwd_mod._POST_MAX_ATTEMPTS
+
+
+async def test_post_event_permanent_4xx_surfaces_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A permanent 4xx is returned on the first attempt so callers see it."""
+    server, opencode = _FlakyServerClient([400]), _FakeOpenCodeClient()
+    delays = _record_sleeps(monkeypatch)
+    fwd = _forwarder(server, opencode)  # type: ignore[arg-type]
+
+    response = await fwd._post_event("external_subagent_start", {"subagent_id": "ses_child"})
+
+    assert response is not None
+    assert response.status_code == 400
+    assert len(server.urls) == 1, "a permanent client error must not be retried"
+    assert delays == []
+
+
 # --- handler table ----------------------------------------------------------
 
 
