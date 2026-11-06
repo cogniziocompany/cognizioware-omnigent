@@ -5578,6 +5578,86 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         return _to_conversation(ap_row, meta, labels)
 
+    def clear_external_session_id_if_qualified(
+        self,
+        conversation_id: str,
+        *,
+        expected: str,
+        native_session_gone: bool,
+    ) -> bool:
+        """
+        Clear a stale native-session link, but only with no work in flight.
+
+        Guards mirror :meth:`ConversationStore.clear_external_session_id_if_qualified`:
+        a gone native session is necessary but not sufficient — a turn
+        that is still running, a parked approval, an outliving
+        background shell, or a startup input queued for delivery all
+        depend on the row's current link, so any of them refuses.
+
+        Pending inputs live on the AP database and the live-effect flags
+        on the Omnigent database, so the read-then-clear cannot be one
+        transaction; the clear itself re-checks the Omnigent-side flags
+        under the row lock it shares with :meth:`set_external_session_id`.
+
+        :param conversation_id: Conversation to update, e.g. ``"conv_abc123"``.
+        :param expected: The stored native session id the caller saw.
+        :param native_session_gone: ``True`` only when the native session
+            named by ``expected`` is confirmed absent.
+        :returns: ``True`` when the link was cleared, ``False`` otherwise.
+        :raises ConversationNotFoundError: If no conversation row exists.
+        """
+        if not native_session_gone:
+            return False
+        if self.list_pending_inputs(conversation_id):
+            return False
+        updated_at = now_epoch()
+
+        def clear_metadata(session: Session) -> bool:
+            meta_query = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
+            )
+            if self._meta_supports_for_update:
+                meta_query = meta_query.with_for_update()
+            meta = session.scalar(meta_query)
+            if meta is None:
+                raise ConversationNotFoundError(
+                    f"conversation {conversation_id!r} does not exist",
+                )
+            if meta.external_session_id is None or meta.external_session_id != expected:
+                return False
+            if meta.live_status in (
+                encode_session_live_status("running"),
+                encode_session_live_status("waiting"),
+            ):
+                return False
+            if meta.pending_elicitation_count:
+                return False
+            if meta.background_work_running:
+                return False
+            meta.external_session_id = None
+            return True
+
+        cleared = run_write_transaction(
+            self._session_immediate,
+            "clear_external_session_id_if_qualified",
+            clear_metadata,
+        )
+        if not cleared:
+            return False
+
+        def touch_conversation(session: Session) -> None:
+            ap_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
+            if ap_row is not None:
+                ap_row.updated_at = updated_at
+
+        run_write_transaction(
+            self._conv_session_immediate,
+            "clear_external_session_id_if_qualified_conversation",
+            touch_conversation,
+        )
+        return True
+
     def create_session_with_agent(
         self,
         *,

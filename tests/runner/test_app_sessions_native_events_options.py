@@ -1573,6 +1573,70 @@ async def test_events_clear_on_opencode_native_relaunches_fresh(
 
 
 @pytest.mark.asyncio
+async def test_events_clear_on_opencode_native_unlinks_the_discarded_session(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``/clear`` unlinks the dropped OpenCode session before relaunching.
+
+    The relaunch records the replacement id, and the server refuses an
+    overwrite, so the old link must be cleared first — with the explicit
+    "native session is gone" confirmation the server requires.
+    """
+    from omnigent.runner import native_controls
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = "7b3d1f0c8a2e4d19b6c05f7a1e93d842"
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    patches: list[tuple[str, dict[str, Any]]] = []
+
+    class _RecordingServerClient(NullServerClient):
+        async def patch(  # type: ignore[override]
+            self, url: str, **kwargs: Any
+        ) -> NullServerClient._Response:
+            patches.append((url, kwargs.get("json") or {}))
+            return self._Response()
+
+    async def _fake_auto_create(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(native_controls, "_auto_create_opencode_terminal", _fake_auto_create)
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("opencode", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("opencode", "main")] = instance
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_RecordingServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+    async with _runner_client(app) as http_client:
+        create_resp = await http_client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": "ag_1"}
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await http_client.post(f"/v1/sessions/{conv_id}/events", json={"type": "clear"})
+
+    assert resp.status_code == 200, resp.text
+    assert [
+        body
+        for url, body in patches
+        if url == f"/v1/sessions/{conv_id}" and "external_session_id" in body
+    ] == [
+        {"external_session_id": None, "external_session_id_native_gone": True},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_events_clear_on_opencode_native_waits_for_an_idle_reap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
