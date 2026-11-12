@@ -4526,6 +4526,45 @@ def register_core_routes(
                     str(exc),
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
+        elif "external_session_id" in body.model_fields_set:
+            # Explicit null unlinks a conversation from a native session
+            # that no longer exists, so the replacement id can be recorded.
+            # The caller must have confirmed the native session is gone;
+            # the store still refuses while work is in flight.
+            if body.external_session_id_native_gone is not True:
+                raise OmnigentError(
+                    "external_session_id can be cleared only with "
+                    "external_session_id_native_gone=true",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            # A caller that reports the id it watched disappear pins the
+            # compare-and-swap to that observation, so a relink between its
+            # check and this request conflicts. Without it, fall back to this
+            # request's snapshot, which is all the reviewed path had.
+            if body.external_session_id_expected is None:
+                expected_external_session_id = updated.external_session_id
+            else:
+                expected_external_session_id = body.external_session_id_expected
+            if expected_external_session_id is None:
+                cleared = True
+            else:
+                try:
+                    cleared = await asyncio.to_thread(
+                        conversation_store.clear_external_session_id_if_qualified,
+                        session_id,
+                        expected=expected_external_session_id,
+                        native_session_gone=True,
+                    )
+                except ConversationNotFoundError as exc:
+                    raise _session_not_found() from exc
+            if not cleared:
+                # Either the session still depends on the old link or
+                # another writer replaced it; retrying cannot help.
+                raise OmnigentError(
+                    "the session's native link changed or still has work "
+                    "in flight; it cannot be unlinked",
+                    code=ErrorCode.CONFLICT,
+                )
         level = await _get_permission_level(user_id, session_id, permission_store)
         # PATCH callers consume only the snapshot's scalar fields (clients
         # hydrate transcripts via GET /sessions/{id}/items), so skip the

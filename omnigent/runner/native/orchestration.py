@@ -1727,6 +1727,13 @@ def _prepare_opencode_native_fork(
     return source_session
 
 
+class _ResolvedOpenCodeSession(NamedTuple):
+    """The OpenCode session to attach and whether the persisted one is gone."""
+
+    session_id: str
+    resumed_session_gone: bool
+
+
 async def _resolve_opencode_session(
     *,
     client: OpenCodeClient,
@@ -1736,13 +1743,17 @@ async def _resolve_opencode_session(
     server_client: httpx.AsyncClient | None,
     fork_source_session_id: str | None,
     fresh: bool = False,
-) -> str:
+) -> _ResolvedOpenCodeSession:
     """
     Resume, fork, or create the conversation's OpenCode session.
 
     Order: resume the persisted session; else fork the staged source session;
     else create a session that asks for every permission and, for a lost
     session or a forked clone, seed the Omnigent transcript as context.
+
+    ``resumed_session_gone`` reports that the persisted id was looked up and
+    the runtime no longer has it — the reconcile case where the stored link
+    must be cleared before the replacement id can be recorded.
 
     :param client: Client bound to the conversation's ``opencode serve``.
     :param launch_config: The conversation's launch config.
@@ -1752,7 +1763,7 @@ async def _resolve_opencode_session(
     :param fork_source_session_id: Source session staged by
         :func:`_prepare_opencode_native_fork`, or ``None``.
     :param fresh: ``True`` for ``/clear``: always create an unseeded session.
-    :returns: The OpenCode session id to attach.
+    :returns: The OpenCode session id to attach and the loss flag.
     """
     from omnigent.harnesses.opencode_native.client import OpenCodeClientError
     from omnigent.harnesses.opencode_native.provider import ASK_ALL_PERMISSIONS
@@ -1761,7 +1772,7 @@ async def _resolve_opencode_session(
     if not fresh and launch_config.external_session_id is not None:
         existing = await client.get_session(launch_config.external_session_id)
         if existing is not None:
-            return existing.id
+            return _ResolvedOpenCodeSession(existing.id, resumed_session_gone=False)
         resume_lost_history = True
     if not fresh and fork_source_session_id is not None:
         try:
@@ -1775,7 +1786,7 @@ async def _resolve_opencode_session(
                 extra={"session_id": omnigent_session_id},
             )
         else:
-            return forked.id
+            return _ResolvedOpenCodeSession(forked.id, resumed_session_gone=resume_lost_history)
     permissions: list[dict[str, object]] = [dict(rule) for rule in ASK_ALL_PERMISSIONS]
     created = await client.create_session(
         title=f"omnigent:{omnigent_session_id}",
@@ -1790,7 +1801,59 @@ async def _resolve_opencode_session(
             omnigent_session_id=omnigent_session_id,
             server_client=server_client,
         )
-    return created.id
+    return _ResolvedOpenCodeSession(created.id, resumed_session_gone=resume_lost_history)
+
+
+async def _clear_lost_opencode_session_id(
+    server_client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    lost_session_id: str | None,
+) -> bool:
+    """
+    Unlink a conversation from an OpenCode session the runtime no longer has.
+
+    The overwrite guard refuses a replacement id while the stored one is
+    still set, so a relaunch after the native session vanished must clear
+    it first. The server clears only when nothing is in flight on the
+    conversation; a refusal leaves the stale link and the caller logs it.
+
+    :param server_client: Runner Omnigent server client.
+    :param session_id: Omnigent conversation id.
+    :param lost_session_id: The stored OpenCode session id that is gone.
+    :returns: Whether the stored link is free for the replacement id.
+    """
+    if lost_session_id is None:
+        return True
+    try:
+        response = await server_client.patch(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            json={
+                "external_session_id": None,
+                "external_session_id_native_gone": True,
+            },
+            params={"include_usage": "false"},
+            timeout=10.0,
+        )
+    except httpx.HTTPError:
+        _logger.warning(
+            "opencode reconcile: could not unlink %s from lost session %s",
+            session_id,
+            lost_session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return False
+    if not response.is_success:
+        _logger.warning(
+            "opencode reconcile: server kept %s linked to lost session %s (HTTP %s)",
+            session_id,
+            lost_session_id,
+            response.status_code,
+            extra={"session_id": session_id},
+        )
+        return False
+    return True
 
 
 # Root ``opencode`` flags the runner owns: auto-approval would bypass policy,
@@ -2077,7 +2140,7 @@ async def _auto_create_opencode_terminal(
                     exc_info=True,
                     extra={"session_id": session_id},
                 )
-            opencode_session_id = await _resolve_opencode_session(
+            resolved = await _resolve_opencode_session(
                 client=client,
                 launch_config=launch_config,
                 omnigent_session_id=session_id,
@@ -2086,6 +2149,21 @@ async def _auto_create_opencode_terminal(
                 fork_source_session_id=fork_source_session_id,
                 fresh=fresh,
             )
+            opencode_session_id = resolved.session_id
+            if resolved.resumed_session_gone and server_client is not None:
+                unlinked = await _clear_lost_opencode_session_id(
+                    server_client,
+                    session_id,
+                    lost_session_id=launch_config.external_session_id,
+                )
+                if not unlinked:
+                    # The stale link still stands, so recording the
+                    # replacement would be refused and the launch would run
+                    # pinned to a session the runtime lost. Abort instead; the
+                    # enclosing handler closes the server and its sessions.
+                    raise RuntimeError(
+                        f"opencode relaunch: could not clear lost session link for {session_id}"
+                    )
             # Persist a newly created or forked session id so a relaunch resumes it.
             if (
                 server_client is not None

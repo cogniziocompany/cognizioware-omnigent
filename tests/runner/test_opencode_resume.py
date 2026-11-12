@@ -14,6 +14,7 @@ from omnigent.harnesses.opencode_native.provider import ASK_ALL_PERMISSIONS
 from omnigent.runner.native.orchestration import (
     _OpenCodeNativeLaunchConfig,
     _resolve_opencode_session,
+    _ResolvedOpenCodeSession,
 )
 
 _ITEMS: list[dict[str, Any]] = [
@@ -175,7 +176,7 @@ async def _resolve(
     *,
     fork_source_session_id: str | None = None,
     fresh: bool = False,
-) -> str:
+) -> _ResolvedOpenCodeSession:
     return await _resolve_opencode_session(
         client=client,  # type: ignore[arg-type]
         launch_config=config,
@@ -189,13 +190,17 @@ async def _resolve(
 
 async def test_resolve_resumes_existing_session() -> None:
     client = _FakeSessionClient(existing="ses_old")
-    assert await _resolve(client, _config(external_session_id="ses_old")) == "ses_old"
+    resolved = await _resolve(client, _config(external_session_id="ses_old"))
+    assert resolved.session_id == "ses_old"
+    assert resolved.resumed_session_gone is False
     assert client.created == [] and client.seeded == []
 
 
 async def test_resolve_lost_session_creates_and_seeds() -> None:
     client = _FakeSessionClient()
-    assert await _resolve(client, _config(external_session_id="ses_gone")) == "ses_new"
+    resolved = await _resolve(client, _config(external_session_id="ses_gone"))
+    assert resolved.session_id == "ses_new"
+    assert resolved.resumed_session_gone is True
     assert client.created == [
         {
             "title": "omnigent:conv_1",
@@ -209,16 +214,19 @@ async def test_resolve_lost_session_creates_and_seeds() -> None:
 
 async def test_resolve_new_session_is_not_seeded() -> None:
     client = _FakeSessionClient()
-    assert await _resolve(client, _config()) == "ses_new"
+    resolved = await _resolve(client, _config())
+    assert resolved.session_id == "ses_new"
+    assert resolved.resumed_session_gone is False
     assert client.seeded == []
 
 
 async def test_resolve_native_fork() -> None:
     client = _FakeSessionClient()
-    session_id = await _resolve(
+    resolved = await _resolve(
         client, _config(fork_carry_history=True), fork_source_session_id="ses_src"
     )
-    assert session_id == "ses_forked"
+    assert resolved.session_id == "ses_forked"
+    assert resolved.resumed_session_gone is False
     assert client.forked == [("ses_src", None)]
     assert client.created == [] and client.seeded == []
 
@@ -229,20 +237,99 @@ async def test_resolve_native_fork() -> None:
 )
 async def test_resolve_fork_failure_falls_back_to_preamble(error: Exception) -> None:
     client = _FakeSessionClient(fork_error=error)
-    session_id = await _resolve(
+    resolved = await _resolve(
         client, _config(fork_carry_history=True), fork_source_session_id="ses_src"
     )
-    assert session_id == "ses_new"
+    assert resolved.session_id == "ses_new"
+    assert resolved.resumed_session_gone is False
     assert [sid for sid, _ in client.seeded] == ["ses_new"]
 
 
 async def test_resolve_fresh_ignores_resume_and_fork() -> None:
     client = _FakeSessionClient(existing="ses_old")
-    session_id = await _resolve(
+    resolved = await _resolve(
         client,
         _config(external_session_id="ses_old", fork_carry_history=True),
         fork_source_session_id="ses_src",
         fresh=True,
     )
-    assert session_id == "ses_new"
+    assert resolved.session_id == "ses_new"
+    assert resolved.resumed_session_gone is False
     assert client.forked == [] and client.seeded == []
+
+
+# ── _clear_lost_opencode_session_id ─────────────────────────────────────────
+
+
+class _RecordingPatchClient:
+    """Server client stub recording the reconcile PATCH it receives."""
+
+    def __init__(self, *, status_code: int = 200, error: Exception | None = None) -> None:
+        self.patches: list[tuple[str, dict[str, Any]]] = []
+        self.status_code = status_code
+        self._error = error
+
+    async def patch(self, url: str, *, json: dict[str, Any], **kwargs: Any) -> httpx.Response:
+        self.patches.append((url, json))
+        if self._error is not None:
+            raise self._error
+        return httpx.Response(self.status_code, request=httpx.Request("PATCH", url))
+
+
+async def test_clear_lost_session_id_marks_the_native_session_gone() -> None:
+    """The reconcile unlink tells the server the stored id is confirmed absent."""
+    server = _RecordingPatchClient()
+
+    freed = await app._clear_lost_opencode_session_id(
+        server,  # type: ignore[arg-type]
+        "conv_1",
+        lost_session_id="ses_gone",
+    )
+
+    assert freed is True
+    [(url, body)] = server.patches
+    assert url == "/v1/sessions/conv_1"
+    # The null alone is ambiguous; the confirmation is what lets the server
+    # clear a populated link without tripping the overwrite guard.
+    assert body == {"external_session_id": None, "external_session_id_native_gone": True}
+
+
+async def test_clear_lost_session_id_reports_a_refused_clear() -> None:
+    """A server refusal (work in flight) leaves the link and reports not freed."""
+    server = _RecordingPatchClient(status_code=409)
+
+    freed = await app._clear_lost_opencode_session_id(
+        server,  # type: ignore[arg-type]
+        "conv_1",
+        lost_session_id="ses_gone",
+    )
+
+    assert freed is False
+    assert len(server.patches) == 1
+
+
+async def test_clear_lost_session_id_survives_a_transport_failure() -> None:
+    """A transport error must not abort the relaunch that follows it."""
+    server = _RecordingPatchClient(error=httpx.ConnectError("refused"))
+
+    freed = await app._clear_lost_opencode_session_id(
+        server,  # type: ignore[arg-type]
+        "conv_1",
+        lost_session_id="ses_gone",
+    )
+
+    assert freed is False
+
+
+async def test_clear_lost_session_id_is_a_noop_without_a_stored_id() -> None:
+    """Nothing was persisted, so there is nothing to unlink."""
+    server = _RecordingPatchClient()
+
+    freed = await app._clear_lost_opencode_session_id(
+        server,  # type: ignore[arg-type]
+        "conv_1",
+        lost_session_id=None,
+    )
+
+    assert freed is True
+    assert server.patches == []
