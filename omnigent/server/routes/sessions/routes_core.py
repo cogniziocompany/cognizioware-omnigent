@@ -4217,15 +4217,22 @@ def register_core_routes(
                     "external_session_id_native_gone=true",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            stored_external_session_id = updated.external_session_id
-            if stored_external_session_id is None:
+            # A caller that reports the id it watched disappear pins the
+            # compare-and-swap to that observation, so a relink between its
+            # check and this request conflicts. Without it, fall back to this
+            # request's snapshot, which is all the reviewed path had.
+            if body.external_session_id_expected is None:
+                expected_external_session_id = updated.external_session_id
+            else:
+                expected_external_session_id = body.external_session_id_expected
+            if expected_external_session_id is None:
                 cleared = True
             else:
                 try:
                     cleared = await asyncio.to_thread(
                         conversation_store.clear_external_session_id_if_qualified,
                         session_id,
-                        expected=stored_external_session_id,
+                        expected=expected_external_session_id,
                         native_session_gone=True,
                     )
                 except ConversationNotFoundError as exc:

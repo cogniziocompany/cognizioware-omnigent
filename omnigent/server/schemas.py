@@ -2721,6 +2721,15 @@ class UpdateSessionRequest(BaseModel):
         running/waiting turn, a parked approval, a background shell,
         or a startup input not yet delivered). Ignored for a
         non-null ``external_session_id``.
+    :param external_session_id_expected: The id the caller observed
+        before deciding the native session was gone. Supplying it moves
+        the compare-and-swap to the HTTP boundary: the stored link must
+        still equal this value when the unlink is applied, so a
+        concurrent relink between the caller's observation and this
+        request is refused with ``conflict`` instead of clearing the
+        newer link. Omitting it keeps this request's own snapshot as
+        the expected value, the reviewed behaviour. Ignored for a
+        non-null ``external_session_id``.
     :param terminal_launch_args: Per-session native-terminal
         pass-through args, e.g. ``["--dangerously-skip-permissions"]``.
         Updating this field requires session ownership.
@@ -2771,6 +2780,7 @@ class UpdateSessionRequest(BaseModel):
     share_workspace_files: bool | None = None
     external_session_id: str | None = None
     external_session_id_native_gone: bool | None = None
+    external_session_id_expected: str | None = None
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None
     delete_worktree: bool = False
