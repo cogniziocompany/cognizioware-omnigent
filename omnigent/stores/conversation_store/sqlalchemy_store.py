@@ -3192,6 +3192,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                 if item.response_id == PENDING_INPUT_RESPONSE_ID
                 and item.stable_id not in existing_by_id
             }
+            if new_pending and self._conv_engine is self._engine:
+                # Serialize with the unlink's clear, which reads pending
+                # inputs while holding this row lock: an enqueue lands either
+                # before that read (and refuses the clear) or after it (and
+                # waits for the clear to commit).
+                session.get(
+                    SqlConversationMetadata,
+                    (current_workspace_id(), conversation_id),
+                    with_for_update=True,
+                )
             if new_pending:
                 queued = list(
                     session.scalars(
@@ -5594,10 +5604,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         background shell, or a startup input queued for delivery all
         depend on the row's current link, so any of them refuses.
 
-        Pending inputs live on the AP database and the live-effect flags
-        on the Omnigent database, so the read-then-clear cannot be one
-        transaction; the clear itself re-checks the Omnigent-side flags
-        under the row lock it shares with :meth:`set_external_session_id`.
+        The pending-input read and the metadata update share one lock when
+        both stores use one engine: the read runs inside the write
+        transaction that already holds the metadata row lock, so an enqueue
+        either commits first (and refuses the clear) or waits for the clear
+        to commit. A split AP database keeps the standalone read, since the
+        two databases cannot share a transaction.
 
         :param conversation_id: Conversation to update, e.g. ``"conv_abc123"``.
         :param expected: The stored native session id the caller saw.
@@ -5608,7 +5620,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         if not native_session_gone:
             return False
-        if self.list_pending_inputs(conversation_id):
+        if self._conv_engine is not self._engine and self.list_pending_inputs(conversation_id):
             return False
         updated_at = now_epoch()
 
@@ -5624,6 +5636,19 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
+            if self._conv_engine is self._engine:
+                # Read pending inputs under the same lock as the update below.
+                pending_input_id = session.scalar(
+                    select(SqlConversationItem.id)
+                    .where(
+                        SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == conversation_id,
+                        SqlConversationItem.response_id == PENDING_INPUT_RESPONSE_ID,
+                    )
+                    .limit(1)
+                )
+                if pending_input_id is not None:
+                    return False
             if meta.external_session_id is None or meta.external_session_id != expected:
                 return False
             if meta.live_status in (

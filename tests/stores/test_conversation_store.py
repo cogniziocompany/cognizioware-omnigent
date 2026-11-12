@@ -10352,3 +10352,59 @@ def test_family_membership_is_independent_of_labels(conversation_store) -> None:
         source.id,
         sibling.id,
     }
+
+
+def test_clear_external_session_id_if_qualified_fences_an_enqueue_after_the_check(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An input enqueued between the pending check and the meta write still blocks.
+
+    The clear reads pending inputs and then writes the metadata row. An
+    enqueue that commits in that window must not slip through: the read and
+    the write share the metadata row lock, so the enqueue serializes behind
+    them and the clear refuses.
+    """
+    from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
+    from omnigent.stores.conversation_store import sqlalchemy_store as store_module
+
+    conv = conversation_store.create_conversation()
+    conversation_store.set_external_session_id(conv.id, "sid-gone")
+    enqueued: list[bool] = []
+
+    def _enqueue_after_the_check() -> float:
+        # Stands in for the moment the reviewed path released the check:
+        # an enqueue lands here, before the metadata write acquires its lock.
+        if not enqueued:
+            enqueued.append(True)
+            conversation_store.append(
+                conv.id,
+                [
+                    NewConversationItem(
+                        type="message",
+                        response_id=PENDING_INPUT_RESPONSE_ID,
+                        status="in_progress",
+                        data=MessageData(
+                            role="user",
+                            content=[{"type": "input_text", "text": "queued"}],
+                        ),
+                    )
+                ],
+            )
+        return 1.0
+
+    monkeypatch.setattr(store_module, "now_epoch", _enqueue_after_the_check)
+
+    cleared = conversation_store.clear_external_session_id_if_qualified(
+        conv.id,
+        expected="sid-gone",
+        native_session_gone=True,
+    )
+
+    assert enqueued == [True]
+    assert cleared is False
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    # The queued input depends on the old link, so the clear must not land.
+    assert fetched.external_session_id == "sid-gone"
