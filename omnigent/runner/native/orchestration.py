@@ -2088,11 +2088,19 @@ async def _auto_create_opencode_terminal(
             )
             opencode_session_id = resolved.session_id
             if resolved.resumed_session_gone and server_client is not None:
-                await _clear_lost_opencode_session_id(
+                unlinked = await _clear_lost_opencode_session_id(
                     server_client,
                     session_id,
                     lost_session_id=launch_config.external_session_id,
                 )
+                if not unlinked:
+                    # The stale link still stands, so recording the
+                    # replacement would be refused and the launch would run
+                    # pinned to a session the runtime lost. Abort instead; the
+                    # enclosing handler closes the server and its sessions.
+                    raise RuntimeError(
+                        f"opencode relaunch: could not clear lost session link for {session_id}"
+                    )
             # Persist a newly created or forked session id so a relaunch resumes it.
             if (
                 server_client is not None

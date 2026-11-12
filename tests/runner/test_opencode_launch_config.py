@@ -228,3 +228,119 @@ async def test_launch_survives_env_provider_key_hand_off_failure(
         )
 
     assert resolve_calls == ["reached"]
+
+
+class _RecordingServerClient:
+    """Server client that records PATCHes and answers the unlink with a set status."""
+
+    def __init__(self, *, status_code: int = 409, error: Exception | None = None) -> None:
+        self._status_code = status_code
+        self._error = error
+        self.patches: list[tuple[str, dict[str, Any]]] = []
+
+    async def patch(self, url: str, **kwargs: Any) -> Any:
+        if self._error is not None:
+            raise self._error
+        self.patches.append((url, kwargs.get("json", {})))
+        return _UnlinkResponse(self._status_code)
+
+
+class _UnlinkResponse:
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+        self.is_success = 200 <= status_code < 300
+
+
+def _lost_session_env(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
+    """Make the launch resolve to a lost native session, as a resume of a gone id does."""
+
+    async def _fake_resolve(**kwargs: Any) -> orchestration._ResolvedOpenCodeSession:
+        return orchestration._ResolvedOpenCodeSession("ses_new", resumed_session_gone=True)
+
+    async def _launch_config(**kwargs: Any) -> orchestration._OpenCodeNativeLaunchConfig:
+        return orchestration._OpenCodeNativeLaunchConfig(
+            workspace=workspace,
+            policy_server_url="http://omnigent.test",
+            terminal_launch_args=[],
+            model_override="anthropic/claude-sonnet-4-5",
+            external_session_id="ses_gone",
+            fork_carry_history=False,
+        )
+
+    monkeypatch.setattr(orchestration, "_resolve_opencode_session", _fake_resolve)
+    monkeypatch.setattr(orchestration, "_opencode_native_launch_config", _launch_config)
+
+
+async def test_launch_aborts_when_the_lost_link_clear_is_refused(
+    launch_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A 409 on the reconcile unlink aborts the launch and leaves nothing running."""
+    monkeypatch.setattr(app_server, "OpenCodeNativeServer", _FakeStartedServer)
+    monkeypatch.setattr(bridge, "seeded_provider_ids", lambda bridge_dir: frozenset())
+    launched: list[Any] = []
+
+    async def _fake_launch(**kwargs: Any) -> Any:
+        launched.append(kwargs)
+        return None
+
+    monkeypatch.setattr(SessionResourceRegistry, "launch_auxiliary_terminal", _fake_launch)
+    _lost_session_env(monkeypatch, tmp_path)
+    server_client = _RecordingServerClient(status_code=409)
+    started: list[_FakeStartedServer] = []
+
+    def _capture(**kwargs: Any) -> _FakeStartedServer:
+        server = _FakeStartedServer(**kwargs)
+        started.append(server)
+        return server
+
+    monkeypatch.setattr(app_server, "OpenCodeNativeServer", _capture)
+
+    with pytest.raises(RuntimeError, match="could not clear lost session link"):
+        await orchestration._auto_create_opencode_terminal(
+            "conv_launch", SessionResourceRegistry(), lambda *a: None, server_client=server_client
+        )
+
+    # Only the refused unlink was attempted; no replacement id was recorded.
+    assert [body for _, body in server_client.patches] == [
+        {"external_session_id": None, "external_session_id_native_gone": True}
+    ]
+    # Nothing was launched and the per-session server was closed and dropped.
+    assert launched == []
+    assert [server.closed for server in started] == [True]
+    assert "conv_launch" not in orchestration._AUTO_OPENCODE_SERVERS
+
+
+async def test_launch_aborts_when_the_lost_link_clear_cannot_reach_the_server(
+    launch_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A transport failure on the reconcile unlink aborts the launch the same way."""
+    import httpx
+
+    monkeypatch.setattr(app_server, "OpenCodeNativeServer", _FakeStartedServer)
+    monkeypatch.setattr(bridge, "seeded_provider_ids", lambda bridge_dir: frozenset())
+    launched: list[Any] = []
+
+    async def _fake_launch(**kwargs: Any) -> Any:
+        launched.append(kwargs)
+        return None
+
+    monkeypatch.setattr(SessionResourceRegistry, "launch_auxiliary_terminal", _fake_launch)
+    _lost_session_env(monkeypatch, tmp_path)
+    server_client = _RecordingServerClient(error=httpx.ConnectError("refused"))
+    started: list[_FakeStartedServer] = []
+
+    def _capture(**kwargs: Any) -> _FakeStartedServer:
+        server = _FakeStartedServer(**kwargs)
+        started.append(server)
+        return server
+
+    monkeypatch.setattr(app_server, "OpenCodeNativeServer", _capture)
+
+    with pytest.raises(RuntimeError, match="could not clear lost session link"):
+        await orchestration._auto_create_opencode_terminal(
+            "conv_launch", SessionResourceRegistry(), lambda *a: None, server_client=server_client
+        )
+
+    assert launched == []
+    assert [server.closed for server in started] == [True]
+    assert "conv_launch" not in orchestration._AUTO_OPENCODE_SERVERS
