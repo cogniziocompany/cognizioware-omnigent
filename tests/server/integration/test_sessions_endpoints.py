@@ -4432,6 +4432,54 @@ async def test_patch_session_external_session_id_null_refused_while_a_turn_runs(
     assert after.json()["external_session_id"] == "sid-gone"
 
 
+async def test_patch_session_external_session_id_null_conflicts_with_a_concurrent_relink(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A null unlink pinned to an observed id conflicts once another writer relinks.
+
+    The caller watched ``sid-gone`` disappear and sends it as the id it
+    observed. Between that observation and this request another worker
+    relinked the session to ``sid-live``. The compare-and-swap is pinned to
+    the caller's id, so the unlink conflicts instead of clearing the live
+    link, and the replacement link survives intact.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"external_session_id": "sid-gone"},
+    )
+
+    # Another writer recovers first and relinks before the caller's request.
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.clear_external_session_id_if_qualified(
+        session["id"], expected="sid-gone", native_session_gone=True
+    )
+    relink = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"external_session_id": "sid-live"},
+    )
+    assert relink.status_code == 200, relink.text
+    assert relink.json()["external_session_id"] == "sid-live"
+
+    resp = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={
+            "external_session_id": None,
+            "external_session_id_native_gone": True,
+            "external_session_id_expected": "sid-gone",
+        },
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "conflict"
+    # The concurrent relink wins: the live link is not cleared.
+    after = await client.get(f"/v1/sessions/{session['id']}")
+    assert after.json()["external_session_id"] == "sid-live"
+
+
 async def test_patch_session_external_session_id_null_requires_the_gone_confirmation(
     client: httpx.AsyncClient,
 ) -> None:
