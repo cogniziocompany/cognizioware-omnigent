@@ -2229,8 +2229,7 @@ class SandboxStatus(BaseModel):
         has none) → ``starting`` (starting the in-sandbox host) →
         ``connecting`` (launching the agent runner) → ``ready`` /
         ``failed``.
-    :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
-        or ``None`` when unknown.
+    :param provider: Sandbox provider being launched, or ``None`` when unknown.
     :param details: What the user needs to do when
         ``stage == "action_required"``, e.g. ``"Sign in on your laptop."``.
         ``None`` otherwise.
@@ -2928,6 +2927,22 @@ class CodexGoalResponse(BaseModel):
     """
 
     goal: CodexGoalObject | None
+
+
+class CodexGoalReadResponse(CodexGoalResponse):
+    """Goal read with explicit availability from the native backend.
+
+    :param available: Whether the backend confirmed the goal, including its
+        absence. An unavailable read must not replace the caller's snapshot.
+    """
+
+    available: Annotated[bool, Strict()]
+
+    @model_validator(mode="after")
+    def _validate_unavailable_goal(self) -> Self:
+        if not self.available and self.goal is not None:
+            raise ValueError("An unavailable goal read cannot contain a goal")
+        return self
 
 
 class SetCodexGoalRequest(BaseModel):
@@ -4410,8 +4425,7 @@ class SessionSandboxStatusEvent(_SSEEventBase):
     :param stage: The launch stage just entered, e.g.
         ``"provisioning"`` — see :class:`SandboxStatus` for the full
         pipeline order.
-    :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
-        or ``None`` when unknown.
+    :param provider: Sandbox provider being launched, or ``None`` when unknown.
     :param details: What the user needs to do when
         ``stage == "action_required"``, e.g. ``"Sign in on your laptop."``.
         ``None`` otherwise.
