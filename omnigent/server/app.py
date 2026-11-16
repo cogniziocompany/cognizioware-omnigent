@@ -83,9 +83,11 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import (
     managed_host_keepalive,
+    session_journal,
     session_live_state,
     session_pull_requests,
     shutdown_state,
+    workflows,
 )
 from omnigent.server.auth import (
     RESERVED_USER_LOCAL,
@@ -139,6 +141,7 @@ from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.preferences import create_preferences_router
 from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
+from omnigent.server.routes.scheduled_task_permissions import scheduled_task_sharing_supported
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
@@ -371,6 +374,12 @@ class ServerInfoResponse(BaseModel):
     # GET/DELETE /v1/sessions/{id}/pull-requests and SessionListItem.pull_request;
     # absent on older servers, which clients treat as unsupported.
     session_pull_requests: bool = False
+    # GET/POST /v1/sessions/{id}/journal and session.journal.appended; absent on
+    # older servers, which clients treat as unsupported.
+    session_journal: bool = False
+    # /v1/workflows, the caller's saved workflows; absent on older servers, which
+    # clients treat as unsupported.
+    workflows: bool = False
     # GET/PUT /v1/settings/session-title-instructions; absent on older servers,
     # which clients treat as unsupported.
     session_title_instructions: bool = False
@@ -383,6 +392,10 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_projects: bool = False
     # Bounded latest-failure feed for the Inbox.
     scheduled_task_inbox: bool = False
+    # Grants can be added through ``/v1/scheduled-tasks/{id}/permissions``: needs
+    # ``automations_v2`` and a store that keeps them. Listing and removing need only the
+    # store, through the API; the automation pages need the flag.
+    scheduled_task_sharing: bool = False
     # Session PATCH and project create check the agent tool's calling session;
     # absent on older servers, where moves must not run.
     session_move_source_checks: bool = False
@@ -3920,6 +3933,10 @@ def create_app(
                 "session_rewind": True,
                 "session_pull_requests": session_pull_requests.open_store(conversation_store)
                 is not None,
+                "session_journal": frontend_features[Feature.WORKFLOWS.value]
+                and session_journal.open_store(conversation_store) is not None,
+                "workflows": frontend_features[Feature.WORKFLOWS.value]
+                and workflows.open_store(conversation_store) is not None,
                 "session_title_instructions": user_settings_store is not None,
                 "admin_view": admin_view_supported,
                 "filesystem_attachments": {
@@ -3930,6 +3947,8 @@ def create_app(
                 "scheduled_task_inbox": automations_enabled,
                 "scheduled_task_one_time": automations_enabled
                 and bool(app.state.one_time_automations_enabled),
+                "scheduled_task_sharing": automations_enabled
+                and scheduled_task_sharing_supported(app.state, permission_store),
                 "session_move_source_checks": True,
                 "session_organize_source_checks": True,
                 "sibling_other_project_standalone": True,
@@ -4192,6 +4211,24 @@ def create_app(
         ),
         prefix="/v1",
         tags=["session_mcp_servers"],
+    )
+    app.include_router(
+        session_journal.create_session_journal_router(
+            conversation_store,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["session_journal"],
+    )
+    app.include_router(
+        workflows.create_workflows_router(
+            conversation_store,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["workflows"],
     )
     if comment_store is not None:
         app.include_router(

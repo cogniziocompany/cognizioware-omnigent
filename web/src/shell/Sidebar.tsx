@@ -96,6 +96,7 @@ import {
   UserRoundIcon,
   UsersIcon,
   WalletIcon,
+  WorkflowIcon,
   XIcon,
   type LucideIcon,
 } from "lucide-react";
@@ -201,7 +202,12 @@ import { isOwnerLevel } from "@/lib/permissionsApi";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
+import {
+  isFeatureEnabled,
+  isSingleUserMode,
+  sandboxOptionLabel,
+  SHARING_OFF_REASON,
+} from "@/lib/capabilities";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
@@ -597,6 +603,7 @@ function useActiveNavItem(): {
   isInboxPage: boolean;
   isCanvasPage: boolean;
   isTasksPage: boolean;
+  isWorkflowsPage: boolean;
   isUsagePage: boolean;
   activeExtensionPageId: string | null;
   newSessionProjectName: string | null;
@@ -618,6 +625,9 @@ function useActiveNavItem(): {
   // True for both /tasks (list) and /tasks/:taskId (detail). Basename-agnostic:
   // match the "tasks" segment by position from the end, not an absolute path.
   const isTasksPage = !isExtensionRoute && (leaf === "tasks" || segments.at(-2) === "tasks");
+  // Likewise /workflows (list) and /workflows/:workflowId (a workflow's page).
+  const isWorkflowsPage =
+    !isExtensionRoute && (leaf === "workflows" || segments.at(-2) === "workflows");
   const isUsagePage = !isExtensionRoute && leaf === "usage";
   const activeExtensionPageId =
     resolveExtensionPageFromPath(extensions, location.pathname)?.page.id ?? null;
@@ -627,6 +637,7 @@ function useActiveNavItem(): {
     !isInboxPage &&
     !isCanvasPage &&
     !isTasksPage &&
+    !isWorkflowsPage &&
     !isUsagePage &&
     !isExtensionRoute;
   const requestedProject = isNewSessionRoute
@@ -642,6 +653,7 @@ function useActiveNavItem(): {
     isInboxPage,
     isCanvasPage,
     isTasksPage,
+    isWorkflowsPage,
     isUsagePage,
     activeExtensionPageId,
     newSessionProjectName,
@@ -798,6 +810,7 @@ function SidebarImpl({
   const branding = useBranding();
   const serverInfo = useServerInfo();
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
+  const workflowsPageEnabled = isFeatureEnabled(serverInfo, "workflows");
   const canvasEnabled = isFeatureEnabled(serverInfo, "canvas");
   const [searchParams] = useSearchParams();
   const canvasDestination = canvasLocation(searchParams.get(CANVAS_QUERY_PARAM) ?? MAIN_CANVAS_ID);
@@ -939,6 +952,7 @@ function SidebarImpl({
     isInboxPage,
     isCanvasPage,
     isTasksPage,
+    isWorkflowsPage,
     isUsagePage,
     activeExtensionPageId,
     newSessionProjectName,
@@ -1461,6 +1475,31 @@ function SidebarImpl({
                       )}
                     />
                     Automations
+                  </Link>
+                </Button>
+              )}
+              {workflowsPageEnabled && (
+                <Button
+                  asChild
+                  className={cn(
+                    SIDEBAR_ROW,
+                    "w-full justify-start border-0 font-normal mobile-touch-target",
+                    SIDEBAR_HOVER_HIGHLIGHT,
+                    isWorkflowsPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                  )}
+                  variant="ghost"
+                  data-testid="workflows-nav"
+                >
+                  <Link to="/workflows" onClick={onNavClick} componentId="sidebar.workflows">
+                    <WorkflowIcon
+                      className={cn(
+                        "ui-icon",
+                        isWorkflowsPage
+                          ? "text-[var(--sidebar-active-foreground)]"
+                          : "text-muted-foreground",
+                      )}
+                    />
+                    Workflows
                   </Link>
                 </Button>
               )}
@@ -4956,9 +4995,7 @@ function ConversationMenuItems({
             {/* Sharing-off is server-wide, so it outranks the per-user owner
                 reason when both apply. */}
             <TooltipContent side="left">
-              {sharingOff
-                ? "Sharing has been disabled for this Omnigent server."
-                : "Only the session owner can share this session"}
+              {sharingOff ? SHARING_OFF_REASON : "Only the session owner can share this session"}
             </TooltipContent>
           </Tooltip>
         ))}
