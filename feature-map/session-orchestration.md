@@ -49,6 +49,10 @@ MCP independent creation.
   An optional `permission_mode` starts the session in a mode of its harness;
   modes that skip approval are refused, and on a server that doesn't advertise
   `session_create_permission_modes` the tool refuses the call before creating anything.
+  An optional `workflow_id` (agent_id only) starts the session as a run of one
+  of the owner's saved workflows, with that workflow's plan already in its
+  journal. With workflows disabled, or on a server that doesn't advertise
+  `session_create_workflow_id`, the tool refuses it before creating anything.
   With `sibling_sessions` enabled they share one sidebar family and do not appear
   as child agents; with it disabled they remain standalone.
   Managed creation uses the server's configured default sandbox provider. A
@@ -62,7 +66,14 @@ MCP independent creation.
   `project_name`. Project defaults do not override the worker's agent or placement.
 - `destinations`: Settings → Admin → General → **Nested agent destinations** limits new
   agents to the current host, the current host or a fresh managed sandbox, or
-  any available host. The server enforces the same choice for the composer,
+  any available host. The Admin → General page itself appears whenever the
+  server offers nested agents or Omni Advisor; on an Advisor-only deploy it
+  carries the Advisor workspace switch and no destinations group. Settings →
+  Admin → General → **Omni Advisor** turns the agent off for the whole
+  workspace: every viewer's Settings → General → **Omni Advisor** switch then
+  shows off and locked with a note that an admin turned it off, and the Inbox
+  drops its Omni Advisor tab. Turning it back on restores each viewer's own
+  choice. The server enforces the same choice for the composer,
   uploaded custom agents, direct API calls, MCP, later host launches, and runner reassignment. Failed
   relaunches retain the prior host so restricted sessions can retry. Any available host is the
   behavior-preserving default. For a standalone session in another project, the policy
