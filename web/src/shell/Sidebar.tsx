@@ -55,6 +55,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import {
+  AppWindowIcon,
   ArchiveIcon,
   BellIcon,
   BellOffIcon,
@@ -136,7 +137,14 @@ import {
 import { useProjectOrder, useSaveProjectOrder } from "@/hooks/useProjectOrder";
 import { useIsMutating, useQueries, useQueryClient } from "@tanstack/react-query";
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
-import { canFlagUnread, isConversationMuted, showsUnreadFor } from "@/lib/sessionMute";
+import {
+  canFlagUnread,
+  isConversationMuted,
+  isInMutedProject,
+  isSessionMuted,
+  showsUnreadFor,
+  useMutedProjects,
+} from "@/lib/sessionMute";
 import {
   Link,
   useLocation,
@@ -249,6 +257,8 @@ import { collectUnreadInboxItems } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { isDesktopLayout, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useOpenSessionWindow } from "@/hooks/useOpenSessionWindow";
+import { isOwnSessionWindow } from "@/lib/sessionWindow";
 import {
   isSideBySideSidebarViewport,
   useIsSideBySideSidebarViewport,
@@ -923,6 +933,7 @@ function SidebarImpl({
   const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
   // Unread sessions as the Inbox lists them; like its row dot, the open session
   // counts only when marked unread.
+  useMutedProjects();
   const unreadInboxCount = useReadStateSnapshot(
     () =>
       collectUnreadInboxItems(
@@ -2050,6 +2061,16 @@ function ProjectFolder({
         }
         active={headerActive}
         marker={marker}
+        headerStatus={
+          menuActions.mute?.muted ? (
+            <BellOffIcon
+              role="img"
+              aria-label="Muted"
+              data-testid="project-muted-icon"
+              className="size-3.5 shrink-0 text-muted-foreground"
+            />
+          ) : undefined
+        }
         conversations={draftRow ? [draftRow, ...display.rows] : display.rows}
         heldConversations={expanded ? undefined : [...(draftRow ? [draftRow] : []), ...heldRows]}
         listRef={listRef}
@@ -2348,6 +2369,7 @@ function ConversationList({
   const unseenTick = useUnseenTick(statusView);
   const draftIds = useSessionDraftIds(statusView);
   const startingId = useStartingConversationId(statusView);
+  const mutedProjects = useMutedProjects();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   // Resolve the active conversation's top-level root once here (rows get a plain
   // `isActive` prop, not their own query). Falls back to the raw id while the
@@ -2763,7 +2785,8 @@ function ConversationList({
       (g) => orderSessionFamilies(g.conversations),
     );
     return { pinned, shared, sessions, projectGroups, groupTitles };
-    // `unseenTick` / `draftIds` aren't read here: they version the stores status buckets read.
+    // `unseenTick` / `draftIds` / `mutedProjects` aren't read here: they version the stores
+    // status buckets read.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     allConversations,
@@ -2788,6 +2811,7 @@ function ConversationList({
     customOrder,
     unseenTick,
     draftIds,
+    mutedProjects,
     startingId,
     workingIds,
   ]);
@@ -5143,7 +5167,7 @@ export function ConversationMenuItems({
 }: {
   /** The menu family to render items from; the kebab's dropdown by default. */
   components?: MenuComponents;
-  /** On a kanban card, only actions that change the board: no nested agent, grid, pin, share or automation. */
+  /** On a kanban card, only actions that change the board: no nested agent, grid, new window, pin, share or automation. */
   kanbanCard?: boolean;
   conversation: Conversation;
   /** Session menu commands whose chords to list (the open session's row only). */
@@ -5185,7 +5209,11 @@ export function ConversationMenuItems({
   reorder?: { previousId?: string; nextId?: string };
 }) {
   const info = useServerInfo();
-  const isMuted = isConversationMuted(conversation);
+  useMutedProjects();
+  const isMuted = isSessionMuted(conversation);
+  // Only the project's own menu can lift a mute that comes from the project, and
+  // while it applies the session's own toggle would change nothing visible.
+  const mutedByProject = isInMutedProject(conversation);
   const setMuted = useSetConversationMuted();
   const atPinCap = useContext(PinCapacityContext);
   const pinSaving = useContext(PinSavingContext);
@@ -5214,6 +5242,9 @@ export function ConversationMenuItems({
   // to the side. `view` swaps between the main actions and that sub-view;
   // desktop always renders the native side-flyout submenu regardless.
   const isMobile = useIsMobileViewport();
+  const openSessionWindow = useOpenSessionWindow();
+  const { conversationId: routeSessionId } = useParams<{ conversationId: string }>();
+  const showsOwnSessionWindow = isOwnSessionWindow(conversation.id, routeSessionId);
   const { trackClick } = useOmnigentAnalytics();
   const [view, setView] = useState<"main" | "move" | "projects" | "nests">("main");
 
@@ -5328,6 +5359,16 @@ export function ConversationMenuItems({
           </C.SubContent>
         </C.Sub>
       )}
+      {openSessionWindow && !kanbanCard && !showsOwnSessionWindow && (
+        <C.Item
+          className="mobile-touch-target"
+          data-testid="open-session-window"
+          onSelect={() => openSessionWindow(conversation.id)}
+        >
+          <AppWindowIcon className="size-3.5" />
+          Open in new window
+        </C.Item>
+      )}
       {/* Desktop pins from the hover button unless Settings hides it; archived
           rows omit Pin (archive outranks pin). */}
       {onTogglePinned && !kanbanCard && !isArchived && !isIndentedSibling(conversation) && (
@@ -5416,10 +5457,15 @@ export function ConversationMenuItems({
         <C.Item
           className="mobile-touch-target"
           data-testid="mute-conversation"
+          disabled={mutedByProject}
           onSelect={() => setMuted.mutate({ id: conversation.id, muted: !isMuted })}
         >
-          {isMuted ? <BellIcon className="size-3.5" /> : <BellOffIcon className="size-3.5" />}
-          {isMuted ? "Unmute" : "Mute"}
+          {isMuted || mutedByProject ? (
+            <BellIcon className="size-3.5" />
+          ) : (
+            <BellOffIcon className="size-3.5" />
+          )}
+          {mutedByProject ? "Muted with project" : isMuted ? "Unmute" : "Mute"}
         </C.Item>
       )}
       {/* Muted sessions can clear unread state, but cannot be flagged unread here. */}
@@ -6200,6 +6246,7 @@ function ConversationRowImpl({
   );
   // Explicit unread overrides active-row suppression; running turns remain
   // hidden through readState.unseen. Muting hides the dot without marking read.
+  useMutedProjects();
   const isMuted = isConversationMuted(conversation);
   const unread = readState.unseen && (!isActive || readState.explicitlyUnread);
   const hasUnseenMessages = showsUnreadFor(conversation, unread);
@@ -7246,6 +7293,20 @@ function ProjectFolderMenuItems({
         <Settings2Icon className="size-3.5" />
         Project settings
       </C.Item>
+      {actions.mute && (
+        <C.Item
+          data-testid="mute-project"
+          disabled={actions.mute.disabled}
+          onSelect={actions.mute.toggle}
+        >
+          {actions.mute.muted ? (
+            <BellIcon className="size-3.5" />
+          ) : (
+            <BellOffIcon className="size-3.5" />
+          )}
+          {actions.mute.muted ? "Unmute project" : "Mute project"}
+        </C.Item>
+      )}
       {actions.ordering && (
         <C.Sub>
           <C.SubTrigger data-testid="move-project">
@@ -7288,6 +7349,8 @@ export interface ProjectFolderMenuActions {
     last: boolean;
     move: (destination: "up" | "down" | "top" | "bottom") => void;
   };
+  /** Mute or unmute every session in the project; absent on servers that can't store it. */
+  mute?: { muted: boolean; disabled: boolean; toggle: () => void };
   openRename: () => void;
   openSettings: () => void;
   openDelete: () => void;
@@ -7340,7 +7403,35 @@ export function useProjectFolderMenu(
   // icon. `null` (staged removal) renders as the empty folder.
   const displayIcon = pendingIcon !== undefined ? pendingIcon : savedIcon;
 
-  const actions = useMemo<ProjectFolderMenuActions>(
+  const info = useServerInfo();
+  const muteSupported = info !== "loading" && info.project_mute === true;
+  const projectMuted = useMutedProjects().some((project) => project.id === projectId);
+  const saveConfig = updateConfig.mutate;
+  const mute = useMemo<ProjectFolderMenuActions["mute"]>(() => {
+    if (!muteSupported) return undefined;
+    return {
+      muted: projectMuted,
+      // Like the icon, the mute merges onto the whole config the PATCH replaces.
+      disabled: !configReady,
+      toggle: () => {
+        if (!configReady) return;
+        const config = { ...(iconConfig ?? {}) };
+        if (projectMuted) delete config.muted;
+        else config.muted = true;
+        saveConfig(
+          { id: projectId, name: projectName, config },
+          {
+            onError: () =>
+              showToast(
+                projectMuted ? "Couldn't unmute the project." : "Couldn't mute the project.",
+              ),
+          },
+        );
+      },
+    };
+  }, [muteSupported, projectMuted, configReady, iconConfig, projectId, projectName, saveConfig]);
+
+  const baseActions = useMemo<ProjectFolderMenuActions>(
     () => ({
       openRename: () => {
         menuOpenedDialogRef.current = true;
@@ -7368,6 +7459,11 @@ export function useProjectFolderMenu(
       },
     }),
     [projectName],
+  );
+  // Kept apart so the menu's open/close callbacks stay stable as the mute loads.
+  const actions = useMemo(
+    () => (mute ? { ...baseActions, mute } : baseActions),
+    [baseActions, mute],
   );
 
   const dialogs = (
