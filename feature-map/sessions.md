@@ -86,6 +86,13 @@ the header menu), and each place is a separate entry point.
   (`web/src/components/chat/TranscriptPaletteCommands.test.tsx`,
   `web/src/canvas/useCanvasHeaderPaletteCommands.test.tsx`,
   `web/src/grid/useGridPaletteCommands.test.tsx`).
+- `palette-pane-corners`: where floating panes can show (`workspace_sidebar_v2` or
+  `floating_panes` on, and not a touch device), the QuickPick palette lists the
+  **Pane corners** setting. **Automatic** follows the server's `floating_panes`
+  policy and names what it gives now; **Floating panes** and **Sharp corners**
+  override it on this device, and a reload keeps the choice. Settings →
+  Appearance offers the same choice (`web/src/shell/settingsCommands.test.ts`,
+  `tests/e2e_ui/sessions/test_floating_panes.py`).
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to
@@ -152,6 +159,8 @@ the header menu), and each place is a separate entry point.
   session starts. Older servers keep the folder-only dialog.
 - `project-rename`: the project menu opens a dialog with the name selected;
   typing replaces it without losing characters as the menu closes.
+  Double-clicking the folder's name renames it inline instead, like a session
+  row; a rejected name shows a toast and keeps the old name.
   Agents rename projects and set their emoji with `sys_project_update`, and
   rename, pin or archive
   sessions with `sys_session_update` (see
@@ -267,8 +276,10 @@ the header menu), and each place is a separate entry point.
   live updates even before it appears in the loaded sidebar pages.
 - `view-options`: the one filter menu, on the Projects header, with Grouping
   (Default / Status / Harness / Created / Updated), Display (All / My / Shared with me / Archived), Ordering
-  (Updated / Created / Custom) and Show (Updated / Environment / Repo / Branch) submenus,
-  saved per device. On phone layouts a submenu replaces the menu's list under a
+  (Updated / Created / Custom) and Show (Harness / Project / Updated / Environment / Repo /
+  Branch) submenus, saved per device. Show → Project names a row's project (its emoji, else a
+  folder glyph) under the title wherever the row isn't inside that project's folder: pins,
+  Shared with me, and every grouping but Default. On phone layouts a submenu replaces the menu's list under a
   back row with its name, and reopening the menu starts at the main list.
   Created ordering keeps sessions newest-created first as messages
   arrive;
@@ -464,7 +475,9 @@ Sessions outside the project, such as one coordinating it, still notify.
 The item appears only on servers that advertise `project_mute` in `/v1/info`.
 
 **Project folder:** right-click its header or open its three-dot menu, then
-choose Rename project. Start typing as soon as the dialog opens. Delete project
+choose Rename project. Start typing as soon as the dialog opens. Or double-click
+the folder's name (not its chevron) to edit it in place: Enter or blur saves,
+Escape cancels, and the dialog remains the place to change its emoji. Delete project
 archives every session in the folder; when any of them has an agent working,
 awaiting approval, or running background work, the dialog says how many and
 that deleting stops them, then asks again with Delete anyway.
@@ -785,7 +798,8 @@ and does not apply to the grid's shared panel. Covered by
 `web/electron/e2e/desktop_right_sidebar_widens_window.e2e.js`.
 While a side chat works, typing a follow-up turns Interrupt into Send, which
 queues or steers it as the main composer does; Escape still interrupts. Its queue
-strip offers edit, steer, reorder and delete, and Mod+Enter steers them all.
+strip offers edit, steer, reorder and delete. Mod+Enter steers them all, or
+queues the draft when Always steer is on.
 Closing the side chat discards the follow-ups queued on that device. Other
 devices keep their tabs and queued work. Closing still stops the chat's running
 turn, as before. A closed Codex side chat resumes on its next message or Resume,
@@ -1012,6 +1026,9 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`project-rename`, project header right-click and three-dot menus:**
   `tests/e2e_ui/sessions/test_project_rename_dialog_focus.py::test_rename_dialog_preselects_name_so_typing_replaces`
   covers typing across the menu's exit animation from both menus.
+- **`project-rename`, double-click the folder name:**
+  `tests/e2e_ui/sessions/test_project_inline_rename.py` saves with Enter and
+  checks the server, cancels with Escape, and shows a duplicate name's toast.
 - **`fork`, message cutoff:**
   `tests/e2e_ui/fork_session/test_fork_from_middle.py::test_fork_from_middle_truncates_history`,
   plus agent switching (own environment):

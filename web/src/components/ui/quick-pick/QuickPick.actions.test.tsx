@@ -354,16 +354,23 @@ describe("QuickPick group headings", () => {
           : new DOMRect(0, 0, 180, 32);
       });
     try {
-      renderPicker({
+      const summary = vi.fn(() => "3 results");
+      const { input } = renderPicker({
         segments: grouped,
         groupCounts: true,
+        summary,
         groupActions: (group) =>
           group === "Files" ? [{ id: "close-all", label: "Close all", run: () => {} }] : [],
       });
-      const headings = [
+      const headings = () => [
         ...document.querySelectorAll<HTMLElement>("[data-slot=quick-pick-group-heading]"),
       ];
-      expect(headings.map((heading) => heading.style.paddingRight)).toEqual(["188px", ""]);
+      expect(headings().map((heading) => heading.style.paddingRight)).toEqual(["188px", ""]);
+      // Moving the selection renders once; measuring the same buttons again sets no state.
+      const settled = summary.mock.calls.length;
+      fireEvent.keyDown(input, { key: "ArrowDown" });
+      expect(summary.mock.calls.length - settled).toBe(1);
+      expect(headings().map((heading) => heading.style.paddingRight)).toEqual(["188px", ""]);
     } finally {
       measure.mockRestore();
     }

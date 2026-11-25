@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { SHORTCUT_GROUPS, shortcutBinding } from "./registry";
 import {
   type ShortcutPageContext,
   type ShortcutPageGroup,
@@ -19,6 +20,7 @@ const CONTEXT_FLAGS = Object.keys({
   browser: true,
   submitWithModEnter: true,
   preventsKeyboardSubmit: true,
+  alwaysSteer: true,
   contentSearch: true,
   grids: true,
   splitTerminal: true,
@@ -26,7 +28,7 @@ const CONTEXT_FLAGS = Object.keys({
   desktopCommands: true,
 } satisfies Record<keyof ShortcutPageContext, true>) as (keyof ShortcutPageContext)[];
 
-/** Every combination of the context flags: 2^10 contexts. */
+/** Every combination of the context flags: 2^11 contexts. */
 function everyContext(): ShortcutPageContext[] {
   return Array.from({ length: 1 << CONTEXT_FLAGS.length }, (_, bits) =>
     Object.fromEntries(CONTEXT_FLAGS.map((flag, index) => [flag, (bits & (1 << index)) !== 0])),
@@ -81,7 +83,7 @@ describe("shortcutPageGroups against the recorded rows", () => {
     { platform: "other platforms", mac: false },
   ])("lists exactly the recorded rows in every context on $platform", ({ mac }) => {
     const contexts = everyContext();
-    expect(contexts).toHaveLength(1024);
+    expect(contexts).toHaveLength(2048);
     for (const context of contexts) {
       expect(
         withoutShortcutIds(shortcutPageGroups(context, mac)),
@@ -98,6 +100,7 @@ const BROWSER_TAB: ShortcutPageContext = {
   browser: false,
   submitWithModEnter: false,
   preventsKeyboardSubmit: false,
+  alwaysSteer: false,
   contentSearch: false,
   grids: false,
   splitTerminal: false,
@@ -153,5 +156,21 @@ describe("shortcutPageGroups", () => {
     expect(labelsIn({ ...BROWSER_TAB, contentSearch: true }, "View")).toContain(
       "Search workspace contents",
     );
+  });
+});
+
+describe("rows the registry binds", () => {
+  it("sit under their binding's group", () => {
+    for (const context of everyContext()) {
+      for (const group of shortcutPageGroups(context, true)) {
+        for (const row of group.items) {
+          if (row.shortcutId === undefined) continue;
+          const { title } = SHORTCUT_GROUPS.find(
+            (candidate) => candidate.id === shortcutBinding(row.shortcutId!).group,
+          )!;
+          expect(group.title, row.shortcutId).toBe(title);
+        }
+      }
+    }
   });
 });

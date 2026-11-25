@@ -5,10 +5,13 @@
 import { isMacPlatform } from "@/lib/hotkeys";
 import { modifierGlyphs } from "@/lib/shortcuts/chord";
 import {
+  SHORTCUT_GROUPS,
   type ShortcutEnvironment,
+  type ShortcutGroupId,
   type ShortcutId,
   shortcutBinding,
   shortcutKeys,
+  shortcutRowKeys,
 } from "@/lib/shortcuts/registry";
 
 export interface ShortcutPageRow {
@@ -41,6 +44,8 @@ export interface ShortcutPageContext {
   submitWithModEnter: boolean;
   /** Touch or narrow layout, where Enter inserts a newline instead of sending. */
   preventsKeyboardSubmit: boolean;
+  /** Follow-ups sent mid-turn steer by default, so the Mod chord queues instead. */
+  alwaysSteer: boolean;
   contentSearch: boolean;
   grids: boolean;
   splitTerminal: boolean;
@@ -49,9 +54,10 @@ export interface ShortcutPageContext {
   desktopCommands: boolean;
 }
 
-/** Keys with the last one replaced by a range label such as "1…0". */
-function withRangeLabel(keys: string[], range: string): string[] {
-  return [...keys.slice(0, -1), range];
+/** The registry's title and note for page group `id`. */
+function groupHeading(id: ShortcutGroupId): Pick<ShortcutPageGroup, "title" | "note"> {
+  const { title, note } = SHORTCUT_GROUPS.find((group) => group.id === id)!;
+  return note === undefined ? { title } : { title, note };
 }
 
 /** The page's groups for this runtime, leaving out groups with no rows. */
@@ -92,7 +98,7 @@ export function shortcutPageGroups(
 
   const groups: ShortcutPageGroup[] = [
     {
-      title: "General",
+      ...groupHeading("general"),
       items: [
         context.native
           ? bound("session.new")
@@ -122,13 +128,15 @@ export function shortcutPageGroups(
       ],
     },
     {
-      title: "In chats",
+      ...groupHeading("chats"),
       items: context.preventsKeyboardSubmit
         ? chatRows.filter((row) => !row.desktopOnly)
         : [
             { label: "Send message", keys: sendWithMod ? [mod, "↵"] : ["↵"] },
             {
-              label: "Send now, with all queued messages",
+              label: context.alwaysSteer
+                ? "Queue message until the agent finishes"
+                : "Send now, with all queued messages",
               keys: sendWithMod ? [mod, shift, "↵"] : [mod, "↵"],
             },
             {
@@ -141,7 +149,7 @@ export function shortcutPageGroups(
           ],
     },
     {
-      title: "Navigation",
+      ...groupHeading("navigation"),
       items: [
         // A browser tab keeps its own Back and Forward.
         ...when(context.electron, [
@@ -151,12 +159,12 @@ export function shortcutPageGroups(
         ]),
         {
           label: shortcutBinding("session.number").label,
-          keys: withRangeLabel(shortcutKeys("session.number", environment), "1…0"),
+          keys: shortcutRowKeys("session.number", environment, context),
         },
       ],
     },
     {
-      title: "View",
+      ...groupHeading("view"),
       items: [
         bound("view.mode"),
         bound("sidebar.left"),
@@ -166,10 +174,7 @@ export function shortcutPageGroups(
         ]),
         {
           label: shortcutBinding("workspace.tab").label,
-          keys: withRangeLabel(
-            shortcutKeys("workspace.tab", environment),
-            context.contentSearch ? "1…5" : "1…4",
-          ),
+          keys: shortcutRowKeys("workspace.tab", environment, context),
         },
         // ⌘T is the desktop menu's New Browser Tab, so older shells have no chord.
         ...when(context.browser && context.desktopCommands, [
@@ -192,8 +197,7 @@ export function shortcutPageGroups(
       ],
     },
     {
-      title: "Panes",
-      note: "in grids and split terminals",
+      ...groupHeading("panes"),
       items: [
         ...when(context.grids || context.splitTerminal, [
           bound("pane.previous"),
@@ -203,8 +207,7 @@ export function shortcutPageGroups(
       ],
     },
     {
-      title: "Slash commands",
-      note: "while the suggestions menu is open",
+      ...groupHeading("slash"),
       items: [
         { label: "Navigate suggestions", keys: ["↑", "↓"] },
         { label: "Apply highlighted command", keys: ["Tab"] },
