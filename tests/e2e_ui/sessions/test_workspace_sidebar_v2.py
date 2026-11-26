@@ -19,6 +19,7 @@ lists its shell, then shows its terminal.
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -50,14 +51,13 @@ _VIEWPORTS = {
 _TABS_CHUNK = re.compile(
     r"/assets/(?:WorkspaceTabsHost|workspaceTabsSessions|featurePaletteRows)-[^/]*\.js"
 )
-# Text only the tabs sidebar's code carries: its CodeMirror token class, history group,
-# New Tab picker and shortcut list. A chunk rule that pulled that code into an eager chunk,
-# or a lazy branch that loaded it, would bring one of them here.
+# Text only the tabs sidebar's code carries (token class, history group, New Tab picker); an
+# eager chunk or lazy load of that code would bring one here. Shortcut labels aren't markers:
+# they live in the shared registry every page loads.
 _TABS_CODE_MARKERS = (
     "cm-shiki-token",
     "Workspace history",
     "Open an app in this tab",
-    "Reopen closed workspace tab",
 )
 _FILE = "tabs_sidebar_notes.py"
 _EDIT = "# saved from the tabs sidebar"
@@ -677,6 +677,73 @@ def test_files_shows_a_folder_chain_as_one_row_through_the_workspace_api(
     expect(sidebar.get_by_role("treeitem", name="Main.java", exact=True)).to_be_visible(
         timeout=15_000
     )
+
+
+_BIG_FOLDER_FILES = 1200
+# Scroll the tree that holds `row` to its end.
+_SCROLL_TREE_TO_END = """(row) => {
+  for (let node = row.parentElement; node; node = node.parentElement) {
+    const scrolls = /(auto|scroll)/.test(getComputedStyle(node).overflowY);
+    if (scrolls && node.scrollHeight > node.clientHeight + 4) {
+      node.scrollTop = node.scrollHeight;
+      return;
+    }
+  }
+}"""
+
+
+def test_files_lists_a_folder_longer_than_one_listing_page_to_its_last_file(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """A folder past one REST listing page of 1,000 entries lists all of them."""
+    # The runner's listing answers 1,000 entries a page, as a session's usually does.
+    base_url, session_id = seeded_session
+    environment = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}/resources/environments/default", timeout=10.0
+    )
+    environment.raise_for_status()
+    # Nothing may have written to the workspace yet, so its root is made along with the folder.
+    big = Path(environment.json()["metadata"]["root"]) / "big"
+    big.mkdir(parents=True)
+    try:
+        _list_big_folder_to_its_end(page, base_url, session_id, big)
+    finally:
+        shutil.rmtree(big, ignore_errors=True)
+
+
+def _list_big_folder_to_its_end(page: Page, base_url: str, session_id: str, big: Path) -> None:
+    for index in range(_BIG_FOLDER_FILES):
+        (big / f"f{index:04d}.txt").write_text(f"file {index}\n")
+    # Listed over REST, whose endpoint answers 1,000 entries a page; the workspace API's host
+    # may list a whole folder in one page.
+    page.route(
+        "**/workspace/omnigent.api.workspace.v1alpha1.WorkspaceService/ListDirectory",
+        lambda route: route.fulfill(
+            status=404,
+            content_type="application/json",
+            body='{"code": "not_found", "message": "listed over REST"}',
+        ),
+    )
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    _open_app(page, sidebar, "Files")
+
+    sidebar.get_by_role("treeitem", name="big", exact=True).click()
+    # Rows are virtualized and the host may list in any order, so a row's set size says how
+    # many entries the folder holds.
+    listed_file = sidebar.get_by_role("treeitem", name=re.compile(r"^f\d{4}\.txt$")).first
+    expect(listed_file).to_have_attribute("aria-setsize", str(_BIG_FOLDER_FILES), timeout=30_000)
+    # Scrolled to its end, the tree reaches the folder's last file.
+    last = sidebar.get_by_role("treeitem", name=f"f{_BIG_FOLDER_FILES - 1:04d}.txt", exact=True)
+    for _ in range(20):
+        if last.count():
+            break
+        listed_file.evaluate(_SCROLL_TREE_TO_END)
+        page.wait_for_timeout(200)
+    expect(last).to_be_visible(timeout=15_000)
 
 
 def test_files_lists_git_ignored_files_marked_as_ignored_only_once_switched_on(

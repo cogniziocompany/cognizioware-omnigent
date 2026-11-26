@@ -10,7 +10,7 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from itertools import batched
 from typing import Any
 
@@ -50,6 +50,7 @@ from omnigent.entities import (
     Agent,
     CommentsFingerprint,
     Conversation,
+    ScheduledTask,
     StoredFile,
     synthesize_conversation_title,
 )
@@ -264,6 +265,7 @@ from omnigent.server.schemas import (
     ReadStatePutRequest,
     ResetSessionModelOverrideRequest,
     ResetSessionModelOverrideResponse,
+    SessionCreateInput,
     SessionCreateRequest,
     SessionEventInput,
     SessionFamily,
@@ -346,6 +348,46 @@ ClearSessionIntoFreshSession = Callable[
     [Request, Conversation, Callable[[], Awaitable[None]]], Awaitable[str]
 ]
 _SESSION_LIST_BATCH_SIZE = 1000
+# Wider re-reads one session-list page may spend making room for dropped side
+# chats. Past this a long run of side chats returns a short page with
+# ``has_more``, and the client continues from ``last_id``.
+_SIDE_CHAT_PAGE_REREADS = 3
+
+
+def _without_side_chats(conversations: list[Conversation]) -> list[Conversation]:
+    """Drop side chats, which surface as Workspace-rail tabs rather than sidebar rows."""
+    return [conv for conv in conversations if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})]
+
+
+def _list_page_without_side_chats(
+    read_page: Callable[[int], PagedList[Conversation]], limit: int, *, allow_reread: bool
+) -> PagedList[Conversation]:
+    """
+    Read up to ``limit`` sessions, re-reading a wider range when side chats crowd them out.
+
+    Every read starts from the caller's cursor and the result is one read's rows and
+    cursor, so rows changing between reads cannot duplicate or skip sessions, and no
+    internal cursor can go stale.
+
+    :param read_page: Reads the requested range with the given row limit.
+    :param limit: Maximum number of visible sessions to return.
+    :param allow_reread: Whether a short page may be re-read with a wider limit.
+    :returns: The visible sessions and the store's cursor for them.
+    """
+    page = read_page(limit)
+    visible = _without_side_chats(page.data)
+    for _ in range(_SIDE_CHAT_PAGE_REREADS if allow_reread else 0):
+        if not page.has_more or len(visible) >= limit:
+            break
+        # Room for exactly the side chats seen so far, so the wider read holds at
+        # most ``limit`` visible rows unless rows changed in between.
+        wider = read_page(limit + len(page.data) - len(visible))
+        wider_visible = _without_side_chats(wider.data)
+        if len(wider_visible) > limit:
+            break
+        page, visible = wider, wider_visible
+    page.data = visible
+    return page
 
 
 def _require_attachment_compatible_history(
@@ -617,6 +659,32 @@ class _SessionPageReads:
     family_info: dict[str, SessionFamily] = dataclasses.field(default_factory=dict)
     user_is_admin: bool = False
     batches: list[_SessionBatchReads] = dataclasses.field(default_factory=list)
+
+
+# Request work running on after its request was cancelled.
+# custom-lint: disable-next=workspace-scoped-cache -- holds globally unique task objects
+_unattended_work: set[asyncio.Task[Any]] = set()
+
+
+def _forget_unattended(done: asyncio.Task[Any]) -> None:
+    """Drop finished work, logging a failure no request is left to report."""
+    _unattended_work.discard(done)
+    if not done.cancelled() and (error := done.exception()) is not None:
+        _logger.warning(
+            "%s failed after its request was cancelled", done.get_name(), exc_info=error
+        )
+
+
+async def _finish_despite_cancellation[T](work: Coroutine[Any, Any, T], *, name: str) -> T:
+    """Await *work*, letting it run to its end if the request is cancelled."""
+    task = asyncio.create_task(work, name=name)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Work that failed just before the cancellation landed still needs its failure logged.
+        _unattended_work.add(task)
+        task.add_done_callback(_forget_unattended)
+        raise
 
 
 def register_core_routes(
@@ -1732,6 +1800,32 @@ def register_core_routes(
                 conversation_store=conversation_store,
                 scheduled_task_store=getattr(request.app.state, "scheduled_task_store", None),
             )
+        create = _create_validated_session(
+            request,
+            user_id,
+            body,
+            source=source,
+            orchestration_source=orchestration_source,
+            launching_task=launching_task,
+        )
+        if body.parent_session_id is not None:
+            # A runner reconciles and retries its own timed-out child create, so
+            # finishing an abandoned one would leave a duplicate child.
+            return await create
+        # A stored session gets its first input and launch even if the client
+        # gives up, so a cancelled request never strands it half-made.
+        return await _finish_despite_cancellation(create, name="create-session")
+
+    async def _create_validated_session(
+        request: Request,
+        user_id: str | None,
+        body: SessionCreateInput,
+        *,
+        source: Conversation | None,
+        orchestration_source: str | None,
+        launching_task: ScheduledTask | None,
+    ) -> SessionResponse:
+        """Store, grant, and launch a session from a validated JSON create *body*."""
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
         resp, conv, resolved_body = await _create_session_from_existing_agent(
             conversation_store,
@@ -2787,42 +2881,41 @@ def register_core_routes(
             include_archived_param = include_archived
             archived_only_param = False
 
+        def _list_store_page(page_limit: int) -> PagedList[Conversation]:
+            return conversation_store.list_conversations(
+                limit=page_limit,
+                after=after,
+                before=before,
+                agent_id=agent_id,
+                agent_name=agent_name,
+                accessible_by=accessible_by_param,
+                owned_by=owned_by_param,
+                shared_only=shared_only_param,
+                has_agent_id=True,
+                # The store treats ``None`` as "no kind filter"; the API
+                # spells that ``kind=any`` to keep the param required-ish
+                # and pattern-validated.
+                kind=None if kind == "any" else kind,
+                order=order,
+                sort_by=sort_by,
+                search_query=normalized_query,
+                search_scope=search_scope,
+                include_archived=include_archived_param,
+                archived_only=archived_only_param,
+                project=project,
+                pinned=pinned,
+                # Pins are per-user: filter to the caller's own pin key.
+                pinned_owner=user_id,
+            )
+
         def _read_page() -> _SessionPageReads:
             # One read-only burst over a single pool checkout per engine: the
             # page query, family projection and every per-row enrichment read
             # they feed. Nothing here waits on a runner or host.
             with shared_read_scope():
-                page = conversation_store.list_conversations(
-                    limit=limit,
-                    after=after,
-                    before=before,
-                    agent_id=agent_id,
-                    agent_name=agent_name,
-                    accessible_by=accessible_by_param,
-                    owned_by=owned_by_param,
-                    shared_only=shared_only_param,
-                    has_agent_id=True,
-                    # The store treats ``None`` as "no kind filter"; the API
-                    # spells that ``kind=any`` to keep the param required-ish
-                    # and pattern-validated.
-                    kind=None if kind == "any" else kind,
-                    order=order,
-                    sort_by=sort_by,
-                    search_query=normalized_query,
-                    search_scope=search_scope,
-                    include_archived=include_archived_param,
-                    archived_only=archived_only_param,
-                    project=project,
-                    pinned=pinned,
-                    # Pins are per-user: filter to the caller's own pin key.
-                    pinned_owner=user_id,
+                page = _list_page_without_side_chats(
+                    _list_store_page, limit, allow_reread=before is None
                 )
-                # Side chats surface only as Workspace-rail tabs, so drop any
-                # side-chat-labeled fork from the sidebar list (it is still a
-                # normal session, just not listed as a top-level one here).
-                page.data = [
-                    conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})
-                ]
                 boundary_row = page.data[-1] if page.data else None
                 page_boundary = (
                     {
@@ -6013,15 +6106,6 @@ def register_core_routes(
 
     # ── Continuing a session's work in another session ──────────
 
-    # Moves into a continuation still running after their request was cancelled.
-    _continuation_tasks: set[asyncio.Task[str]] = set()
-
-    def _forget_continuation(done: asyncio.Task[str]) -> None:
-        """Drop a finished move; its failure was reported to a waiting request."""
-        _continuation_tasks.discard(done)
-        if not done.cancelled():
-            done.exception()  # Retrieved, so an abandoned request's failure is not re-logged.
-
     async def _continue_session_in_fork(
         request: Request,
         source: Conversation,
@@ -6323,10 +6407,7 @@ def register_core_routes(
         # back) even if the request is cancelled, e.g. by a client disconnect,
         # so a cancellation never strands a half-made successor; meanwhile the
         # move guard refuses a retry.
-        task = asyncio.create_task(move(), name=f"continue-{source.id}")
-        _continuation_tasks.add(task)
-        task.add_done_callback(_forget_continuation)
-        return await asyncio.shield(task)
+        return await _finish_despite_cancellation(move(), name=f"continue-{source.id}")
 
     async def clear_session_into_fresh_session(
         request: Request,
