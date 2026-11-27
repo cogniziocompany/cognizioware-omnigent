@@ -62,7 +62,15 @@ the header menu), and each place is a separate entry point.
   marked, so a just-archived session leads the list; Find a session by name
   (⌘⌥S / Ctrl+Alt+S) lists active sessions only. Results show project and parent
   session breadcrumbs when available, including when the parent did not match
-  the search. Desktop and mobile search use the same context.
+  the search. Desktop and mobile search use the same context. With the tabs
+  sidebar on a desktop window, ⌘K's **Search in Sessions…** opens Go to File on
+  its **Sessions** tab, with or without an open session: the same search, with a
+  preview of the matching message beside the list; a failed search or page
+  shows with Retry. Ctrl-N and Ctrl-P step the palette's rows as the arrows do,
+  except that in the Windows and Linux desktop app the menu's New Session
+  accelerator still takes Ctrl+N first (see `composer.md`'s new-session hotkey).
+  Closing it with Escape, or with a command that leaves focus alone, returns the
+  keyboard to the field it was opened from.
 - `palette-ui-feature-overrides`: in QuickPick, **Override UI feature flag…**
   sets a reported UI-only flag to Automatic, On, or Off. Choices stay on this
   device for this server; changing one reloads the page. **Clear all flag overrides**
@@ -78,14 +86,32 @@ the header menu), and each place is a separate entry point.
   stays listed with the reason, and a dialog such as Rename opens with focus in
   it. With `quick_pick_palette`, **Go to Session…** turns the open palette into
   the session switcher; Escape returns focus to where ⌘K was opened.
+- `palette-session-actions`: with `quick_pick_palette` on, ⌘↵ (Ctrl+Enter) on
+  any session's ⌘K row lists that session's row-menu actions, such as Open in
+  new window, Pin, Rename, Add to project, Mute, Archive and Delete; Back
+  returns to the row. Verb-first rows such as **Archive a Session…** ask which
+  session first, searching as ⌘K does (a pasted `#123` or pull request link
+  finds the loaded session linked to it), then list the picked session's
+  actions on that verb, or say why it doesn't apply. Each action is checked
+  against the session's current state as it runs and uses the row menu's
+  dialogs. Archiving or deleting the open session leaves its view; an archive
+  opens the session visited before it. In the desktop app the flag also
+  replaces Ctrl+Tab's recent sessions switcher with Next and Previous session.
+  On macOS, ⌃] / ⌃[ open the held recent-session switcher, from ⌘K too
+  (`web/src/shell/QuickPickCommandPalette.sessionActions.test.tsx`,
+  `web/src/shell/sessionCommands/SessionActionHost.test.tsx`,
+  `tests/e2e_ui/sessions/test_quick_pick_palette.py`).
 - `palette-screen-commands`: with `quick_pick_palette` on (off by default), ⌘K
   also lists the open screen's own actions, each run by its button's handler.
   Under **Conversation**: Copy latest response, Copy link to latest response,
   Fork from latest response… (the message's Fork, opening the same dialog), Copy
-  latest prompt, Copy link to latest prompt, Scroll to newest message, and Stop
-  response while a turn runs. They target the latest message the transcript
-  shows, and one that can't run yet, such as before the first response or for
-  an attachment-only prompt, stays listed with the reason. Under **Canvas**,
+  latest prompt, Copy link to latest prompt, Go to previous message and Go to
+  next message (⌘⌥↑ / ⌘⌥↓, Ctrl+Alt off macOS, the transcript's own steps),
+  Scroll to newest message, and Stop response while a turn runs. They target
+  the latest message the transcript shows, and one that can't run yet, such as
+  before the first response or for an attachment-only prompt, stays listed with
+  the reason. With the flag on, Ctrl+Alt+Shift+↑/↓ off macOS is Previous and
+  Next session rather than a message step. Under **Canvas**,
   while a conversation pane is open: Back to canvas when it fills the window,
   else Focus conversation or Show canvas beside conversation, and Close
   conversation pane. The open grid's sidebar row adds Rename grid…, which edits
@@ -94,6 +120,15 @@ the header menu), and each place is a separate entry point.
   (`web/src/components/chat/TranscriptPaletteCommands.test.tsx`,
   `web/src/canvas/useCanvasHeaderPaletteCommands.test.tsx`,
   `web/src/grid/useGridPaletteCommands.test.tsx`).
+  On the Inbox, ⌘K lists under **Inbox** the **Inbox filter** setting (the tabs)
+  and, for each card, what the card itself offers: Open, Open to respond, Mark
+  as read, Reply…, which expands the card and focuses its reply field where the
+  viewer can reply, and an automation's Open or Mark failed as read. Under
+  **Sessions**, Mark all as read clears every loaded unread session, and the
+  open session's **Conversation** group adds Resume sandbox while its sandbox
+  sleeps or failed to wake (`web/src/pages/InboxPage.test.tsx`,
+  `web/src/shell/markAllReadPaletteCommand.test.tsx`,
+  `web/src/shell/resumeSandboxCommand.test.tsx`).
 - `palette-pane-corners`: where floating panes can show (`workspace_sidebar_v2` or
   `floating_panes` on, and not a touch device), the QuickPick palette lists the
   **Pane corners** setting. **Automatic** follows the server's `floating_panes`
@@ -101,6 +136,14 @@ the header menu), and each place is a separate entry point.
   override it on this device, and a reload keeps the choice. Settings →
   Appearance offers the same choice (`web/src/shell/settingsCommands.test.ts`,
   `tests/e2e_ui/sessions/test_floating_panes.py`).
+- `workspace-full-screen`: with the tabs sidebar (`workspace_sidebar_v2`), ⇧⌘F
+  (Ctrl+Shift+F off the Mac) and the ⌘K row **Make the workspace full screen** /
+  **Exit workspace full screen** toggle the workspace sidebar's full screen. From
+  a closed sidebar, both open it straight into full screen; a focused browser page
+  hands the chord over.
+  The classic layout, a phone and a grid route don't offer them
+  (`web/src/shell/AppShell.workspaceSidebarV2.test.tsx`,
+  `tests/e2e_ui/sessions/test_workspace_sidebar_v2.py`).
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to

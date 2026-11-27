@@ -5,6 +5,7 @@ import { GridSessionsProvider, useGridSessions } from "@/grid/GridSessionsContex
 import { GridWorkspace } from "@/grid/GridWorkspace";
 import {
   LazyFileActionHost,
+  LazyGoToFileHost,
   LazyShowAllPullRequestsCommand,
   LazyWorkspaceTabsHost,
   routeToWorkspaceTabs,
@@ -58,6 +59,9 @@ import type { Session, SessionStatus } from "@/lib/types";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useFloatingComposerSupport } from "@/hooks/useFloatingComposerSupport";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
+import { useWorkspaceFullScreenCommand } from "@/shell/workspaceCommands/useWorkspaceFullScreenCommand";
+import { rightPanelCollapsesItself } from "./rightPanelCollapse";
+import { useRailControlsWidth } from "./workspaceTabs/railControlsWidth";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
 import { useHistoryNavigation } from "@/hooks/useHistoryNavigation";
 import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
@@ -191,6 +195,8 @@ import {
 import { AppShellWorkspacePanels } from "./AppShellWorkspacePanels";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { AppShellOverlays } from "./AppShellOverlays";
+import { MarkAllReadPaletteCommand } from "./markAllReadPaletteCommand";
+import { ResumeSandboxPaletteCommand } from "./resumeSandboxCommand";
 import { AppShellRootProviders } from "./AppShellRootProviders";
 import { replaceThemePicker } from "@/store/themePicker";
 import { replaceFeatureFlagsPicker } from "@/store/featureFlagsPicker";
@@ -540,6 +546,7 @@ function AppShellImpl() {
   const mobileViewport = useIsMobileViewport();
   // The tabs host sits in the Workspace drawer once a narrow window has mounted it.
   const tabsInDrawer = mobileViewport && tabsDrawerTarget !== null;
+  const railControlsWidth = useRailControlsWidth(conversationId);
   const sideBySideSidebar = useIsSideBySideSidebarViewport();
   const atSettingsRoot =
     inSettings && location.pathname.replace(/\/$/, "") === rebasePath("/settings");
@@ -3290,6 +3297,24 @@ function AppShellImpl() {
     !executionLogsOpen &&
     !filesPanelOpen,
   );
+  // ⇧⌘F and its ⌘K row: a hidden workspace opens straight into full screen.
+  const toggleWorkspaceFullScreen = useCallback(() => {
+    if (!workspacePanelVisible) {
+      revealRightPanel();
+      if (!rightPanelMaximized) toggleRightPanelMaximized();
+      return;
+    }
+    toggleRightPanelMaximized();
+  }, [workspacePanelVisible, revealRightPanel, rightPanelMaximized, toggleRightPanelMaximized]);
+  // Only the tabs sidebar fills the window; a phone shows the workspace as its own screen, and
+  // a grid route has its own rail.
+  const workspaceCanFillWindow =
+    tabsSidebar && !!conversationId && hasRailContent && !gridRoute && !mobileViewport;
+  useWorkspaceFullScreenCommand({
+    conversationId: conversationId ?? null,
+    fullScreen: workspaceCanFillWindow ? rightPanelMaximized && workspacePanelVisible : null,
+    toggle: toggleWorkspaceFullScreen,
+  });
   // WIP(session_overview): docks beside chat when a wide window leaves the right side
   // free; otherwise it opens as a popover from the header cost.
   const sessionOverviewEnabled =
@@ -3351,6 +3376,21 @@ function AppShellImpl() {
             sessionId={serverConversationId}
             pullRequestsAvailable={railTabsAvailable.github}
             showAll={() => openGithubTab()}
+          />
+        </Suspense>
+      )}
+      {/* The finder serves every window with the tabs sidebar, at any width: Go to File and Search
+        Text for its session, Sessions on any page. Its code, with the preview's editor, loads only
+        then. */}
+      {tabsSidebar && (
+        <Suspense fallback={null}>
+          <LazyGoToFileHost
+            key={serverConversationId ?? "no-session"}
+            // Files and Text only where the session's files can be browsed; Sessions always.
+            sessionId={showFilesPanel ? (serverConversationId ?? null) : null}
+            openFile={openFileViewer}
+            showTextSearch={() => showTabsPage("content-search")}
+            textSearch={railTabsAvailable["content-search"]}
           />
         </Suspense>
       )}
@@ -3546,6 +3586,15 @@ function AppShellImpl() {
                     hasRailContent={hasRailContent}
                     rightPanelOpen={rightPanelOpen}
                     onToggleRightPanel={toggleRightPanel}
+                    // The floating tabs sidebar collapses from its own corner button, where the toggle sits.
+                    rightPanelCollapsesItself={rightPanelCollapsesItself({
+                      floatingPanesShown,
+                      tabsSidebar,
+                      tabsInDrawer,
+                      rightPanelOpen,
+                      railWidth: inlinePanelWidth,
+                      controlsWidth: railControlsWidth,
+                    })}
                     pending={pendingConversation}
                     mobileMenu={{
                       fileViewerOpen,
@@ -3935,6 +3984,14 @@ function AppShellImpl() {
             serverConversationId={serverConversationId}
             updateOverlayHeight={updateOverlayHeight}
           />
+          {/* ⌘K's Mark all as read and Resume sandbox, with the label and action their own
+              surfaces use. */}
+          {isFeatureEnabled(serverInfo, "quick_pick_palette") && (
+            <>
+              <MarkAllReadPaletteCommand />
+              <ResumeSandboxPaletteCommand />
+            </>
+          )}
         </ForkDialogContextProvider>
       </TerminalFirstContextProvider>
     </AppShellRootProviders>

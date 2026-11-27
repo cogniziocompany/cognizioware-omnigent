@@ -1903,8 +1903,9 @@ export declare type ListLabelsRequest = Message<"omnigent.api.workspace.v1alpha1
   prUrl: string;
 
   /**
-   * Labels whose name matches; unset lists the repository's labels.
-   * Not supported yet: setting this field returns INVALID_ARGUMENT.
+   * Labels whose name or description matches, best match first, at most 50;
+   * unset lists the repository's labels by name. Longer than 256 characters
+   * returns INVALID_ARGUMENT.
    *
    * @generated from field: string text = 2;
    */
@@ -3854,6 +3855,26 @@ export declare type ReadPullRequestImageResponse = Message<"omnigent.api.workspa
 export declare const ReadPullRequestImageResponseSchema: GenMessage<ReadPullRequestImageResponse>;
 
 /**
+ * Attached to a refused pull request call's error: why it was refused, for a client to act on.
+ *
+ * @generated from message omnigent.api.workspace.v1alpha1.PullRequestFailure
+ */
+export declare type PullRequestFailure = Message<"omnigent.api.workspace.v1alpha1.PullRequestFailure"> & {
+  /**
+   * One of "comment_changed", "pull_request_changed", "invalid_input" or "read_only_code_host".
+   *
+   * @generated from field: string reason = 1;
+   */
+  reason: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.PullRequestFailure.
+ * Use `create(PullRequestFailureSchema)` to create a new message.
+ */
+export declare const PullRequestFailureSchema: GenMessage<PullRequestFailure>;
+
+/**
  * @generated from enum omnigent.api.workspace.v1alpha1.EntryType
  */
 export enum EntryType {
@@ -4724,8 +4745,8 @@ export declare const WorkspaceService: GenService<{
     output: typeof DisableAutoMergeResponseSchema;
   },
   /**
-   * Adds a draft comment on a line or range to the pending review, starting one if needed,
-   * or a draft reply in a review conversation to the viewer's pending review.
+   * Adds a draft comment on a line or range, or a draft reply in a review conversation, to the
+   * viewer's pending review; it must already exist, so start one with StartPendingReview.
    *
    * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.AddPendingReviewComment
    */
@@ -5026,7 +5047,8 @@ export declare const WorkspaceService: GenService<{
     output: typeof UpdatePendingReviewCommentResponseSchema;
   },
   /**
-   * Uploads a file to link from a comment.
+   * Uploads a file to link from a comment, up to 70 MiB. Send it with the binary protobuf
+   * encoding: JSON's base64 makes the body a third larger, past the request limit.
    *
    * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.UploadAttachment
    */
