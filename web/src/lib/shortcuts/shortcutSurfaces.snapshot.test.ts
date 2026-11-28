@@ -10,6 +10,7 @@ import {
   APP_SHORTCUT_BINDINGS,
   codeMirrorKeys,
   matchesShortcut,
+  menuShortcutChords,
   type ShortcutEnvironment,
   type ShortcutPageContext,
   type ShortcutId,
@@ -23,7 +24,14 @@ import { rowsForChord, searchableChords } from "@/pages/settings/search/chordQue
 const ENVIRONMENTS: ShortcutEnvironment[] = [true, false].flatMap((mac) =>
   [true, false].flatMap((native) =>
     [true, false].flatMap((desktopMenu) =>
-      [true, false].map((submitWithModEnter) => ({ mac, native, desktopMenu, submitWithModEnter })),
+      // Without the Go menu; "a shell that routes Go" below covers what it moves.
+      [true, false].map((submitWithModEnter) => ({
+        mac,
+        native,
+        desktopMenu,
+        goMenu: false,
+        submitWithModEnter,
+      })),
     ),
   ),
 );
@@ -40,6 +48,7 @@ const EVERYTHING_SUPPORTED: ShortcutPageContext = {
   siblingSessions: true,
   desktopCommands: true,
   alwaysSteer: false,
+  quickPick: false,
 };
 
 const environmentName = ({ mac, native, desktopMenu, submitWithModEnter }: ShortcutEnvironment) =>
@@ -115,10 +124,12 @@ describe("shortcut surfaces", () => {
   });
 
   it("read as recorded in every environment", async () => {
-    // Every row the page can list somewhere: all it reads but those it never lists.
+    // Every row the page can list somewhere, with quick_pick_palette on or off.
     const listed = new Set<ShortcutId>(
-      APP_SHORTCUT_BINDINGS.filter(
-        (binding) => binding.shownWhen?.(EVERYTHING_SUPPORTED) ?? true,
+      APP_SHORTCUT_BINDINGS.filter((binding) =>
+        [false, true].some(
+          (quickPick) => binding.shownWhen?.({ ...EVERYTHING_SUPPORTED, quickPick }) ?? true,
+        ),
       ).map((binding) => binding.id),
     );
     const lines = ENVIRONMENTS.flatMap((environment) => [
@@ -127,5 +138,24 @@ describe("shortcut surfaces", () => {
       ...APP_SHORTCUT_BINDINGS.map(({ id }) => searchLine(id, environment, listed)),
     ]);
     await expect(`${lines.join("\n")}\n`).toMatchFileSnapshot("./shortcutSurfaces.golden.txt");
+  });
+
+  it("move only Back and Forward to a shell that routes Go, which then owns their chords", () => {
+    const listed = new Set<ShortcutId>(APP_SHORTCUT_BINDINGS.map((binding) => binding.id));
+    for (const environment of ENVIRONMENTS.filter(({ desktopMenu }) => desktopMenu)) {
+      const goMenu = { ...environment, goMenu: true };
+      const changed = IDS.filter(
+        (id) =>
+          surfaceLine(id, environment) !== surfaceLine(id, goMenu) ||
+          (listed.has(id) &&
+            searchLine(id, environment, listed) !== searchLine(id, goMenu, listed)),
+      );
+      expect(changed, environmentName(environment)).toEqual(["history.back", "history.forward"]);
+      for (const id of changed) {
+        // The menu's accelerator takes the chord, so the page neither matches nor shows it.
+        expect(activeShortcutChords(id, goMenu)).toEqual([]);
+        expect(menuShortcutChords(id, goMenu)).toHaveLength(1);
+      }
+    }
   });
 });

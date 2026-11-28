@@ -1,18 +1,25 @@
-"""Parent admission/lifetime behavior using inert socket, pidfd and process doubles."""
+"""Parent admission/lifetime units and real Linux process-boundary checks."""
 
 from __future__ import annotations
 
 import array
+import json
 import os
 import select
+import shutil
+import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 from _thread import LockType
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TypeVar
 from unittest.mock import MagicMock
@@ -20,6 +27,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from omnigent.inner import _bwrap_request_control as request_control
+from omnigent.inner import _bwrap_request_init as request_init
+from omnigent.inner._bounded_output import CapturedOutput
+from omnigent.inner.bwrap_sandbox import BwrapRequestFds, BwrapSandboxBackend
+from omnigent.inner.sandbox import SandboxPolicy
+from tests._helpers.polling import poll_until
+from tests._helpers.shell_lifecycle import detached_output_command
 
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="Linux pidfd and credential metadata"
@@ -31,7 +44,9 @@ _LAUNCHER_FD = 42
 _Result = TypeVar("_Result")
 
 
-def _start_worker(action: Callable[[], _Result]) -> tuple[threading.Thread, Future[_Result]]:
+def _start_worker(
+    action: Callable[[], _Result], *, daemon: bool | None = None
+) -> tuple[threading.Thread, Future[_Result]]:
     result: Future[_Result] = Future()
 
     def run() -> None:
@@ -40,7 +55,7 @@ def _start_worker(action: Callable[[], _Result]) -> tuple[threading.Thread, Futu
         except BaseException as error:
             result.set_exception(error)
 
-    worker = threading.Thread(target=run)
+    worker = threading.Thread(target=run, daemon=daemon)
     worker.start()
     return worker, result
 
@@ -87,14 +102,25 @@ def readiness(monkeypatch: pytest.MonkeyPatch) -> tuple[MagicMock, MagicMock, Ma
     return control, process, close
 
 
+@pytest.mark.parametrize("encoding", [None, b"utf-8", b"ISO-8859-1"])
 def test_readiness_requires_the_transferred_init_handle_and_kernel_sender(
     readiness: tuple[MagicMock, MagicMock, MagicMock],
+    encoding: bytes | None,
 ) -> None:
     control, process, close = readiness
+    if encoding is not None:
+        payload, metadata, flags, address = control.recvmsg.return_value
+        control.recvmsg.return_value = (payload + b":" + encoding, metadata, flags, address)
     owner = request_control.BwrapRequestControl.receive(
-        control, process, _TOKEN, expected_init_pid=73, launcher_pidfd=_LAUNCHER_FD
+        control,
+        process,
+        _TOKEN,
+        expected_init_pid=73,
+        launcher_pidfd=_LAUNCHER_FD,
+        encoding_required=encoding is not None,
     )
     assert not owner.admitted and not owner.done.is_set()
+    assert owner._encoding == (encoding.decode("ascii") if encoding is not None else None)
     request_control.os.set_inheritable.assert_called_once_with(_INIT_FD, False)
     assert control.recvmsg.call_args.args[2] == socket.MSG_CMSG_CLOEXEC
     control.send.assert_not_called()
@@ -102,26 +128,35 @@ def test_readiness_requires_the_transferred_init_handle_and_kernel_sender(
 
 
 @pytest.mark.parametrize(
-    "problem",
+    "problem, encoding_required",
     [
-        "token",
-        "missing-credentials",
-        "sender",
-        "uid",
-        "not-pid-one",
-        "dead-pidfd",
-        "foreign-pidfd",
-        "extra-handle",
-        "truncated",
-        "unexpected-before-rights",
-        "family",
-        "launcher",
+        (problem, False)
+        for problem in (
+            "token",
+            "missing-credentials",
+            "sender",
+            "uid",
+            "not-pid-one",
+            "dead-pidfd",
+            "foreign-pidfd",
+            "extra-handle",
+            "truncated",
+            "unexpected-before-rights",
+            "family",
+            "launcher",
+        )
+    ]
+    + [(problem, True) for problem in ("token", "sender", "truncated", "payload-truncated")]
+    + [
+        ("encoding-" + problem, True)
+        for problem in ("missing", "empty", "unknown", "oversized", "non-ascii")
     ],
 )
 def test_invalid_readiness_never_admits_and_releases_every_received_handle(
     monkeypatch: pytest.MonkeyPatch,
     readiness: tuple[MagicMock, MagicMock, MagicMock],
     problem: str,
+    encoding_required: bool,
 ) -> None:
     control, process, close = readiness
     payload, metadata, flags, address = control.recvmsg.return_value
@@ -162,12 +197,28 @@ def test_invalid_readiness_never_admits_and_releases_every_received_handle(
         metadata[0] = (socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", handles).tobytes())
     elif problem == "truncated":
         flags = socket.MSG_CTRUNC
-    else:
+    elif problem == "payload-truncated":
+        flags = socket.MSG_TRUNC
+    elif problem == "unexpected-before-rights":
         metadata.insert(0, (socket.SOL_SOCKET, -1, b"unknown"))
+    encoding = {
+        "encoding-missing": None,
+        "encoding-empty": b"",
+        "encoding-unknown": b"unknown-encoding",
+        "encoding-oversized": b"x" * 129,
+        "encoding-non-ascii": b"\xff",
+    }.get(problem, b"utf-8")
+    if encoding_required and encoding is not None:
+        payload += b":" + encoding
     control.recvmsg.return_value = (payload, metadata, flags, address)
     with pytest.raises((OSError, ValueError)):
         request_control.BwrapRequestControl.receive(
-            control, process, _TOKEN, expected_init_pid=73, launcher_pidfd=_LAUNCHER_FD
+            control,
+            process,
+            _TOKEN,
+            expected_init_pid=73,
+            launcher_pidfd=_LAUNCHER_FD,
+            encoding_required=encoding_required,
         )
     assert sorted(call.args[0] for call in close.call_args_list) == sorted(handles)
     control.send.assert_not_called()
@@ -300,6 +351,74 @@ def test_completion_waits_for_each_pinned_lifetime_and_output(
     assert set(kills) == ({_INIT_FD, _LAUNCHER_FD} if timed_out else set())
     case.control.send.assert_called_once_with(b"admit:" + _TOKEN)
     assert case.owner.admitted and case.owner.done.is_set()
+
+
+@pytest.mark.parametrize(
+    "ending", ["complete", "timeout", "cancel", "read-error", "drain-error", "wait-error"]
+)
+def test_encoded_requests_bound_capture_and_never_accumulate_output_through_communicate(
+    monkeypatch: pytest.MonkeyPatch, request_case: _RequestCase, ending: str
+) -> None:
+    case = request_case
+    case.owner._encoding = "utf-8"
+    capture = MagicMock()
+    capture.result.return_value = (
+        CapturedOutput("out", 1000, nonblank=True),
+        CapturedOutput("err", 2000, nonblank=True),
+    )
+
+    def poll(_timeout: float) -> bool:
+        assert not case.owner.done.is_set()
+        case.exited.update({_INIT_FD: True, _LAUNCHER_FD: True})
+        if ending == "cancel":
+            case.owner.cancel()
+        if ending == "read-error":
+            raise OSError("pipe read failed")
+        return True
+
+    capture.poll.side_effect = poll
+    if ending == "drain-error":
+        capture.drain.side_effect = OSError("capture drain failed")
+    elif ending == "wait-error":
+        case.process.wait.side_effect = OSError("process wait failed")
+    construct = MagicMock(return_value=capture)
+    monkeypatch.setattr(request_control, "BoundedPipeCapture", construct)
+    if ending == "timeout":
+        clock = iter([0.0])
+        monkeypatch.setattr(request_control, "monotonic", lambda: next(clock, 2.0))
+    if ending == "cancel":
+        with pytest.raises(request_control.RequestCancelled):
+            case.owner.run(deadline=1.0, max_output=3)
+    elif ending in {"read-error", "drain-error", "wait-error"}:
+        message = {
+            "read-error": "pipe read failed",
+            "drain-error": "capture drain failed",
+            "wait-error": "process wait failed",
+        }[ending]
+        with pytest.raises(OSError, match=message):
+            case.owner.run(deadline=1.0, max_output=3)
+    else:
+        result = case.owner.run(deadline=1.0, max_output=3)
+        assert result.stdout == CapturedOutput("out", 1000, nonblank=True)
+        assert result.timed_out == (ending == "timeout")
+    construct.assert_called_once_with(
+        case.process.stdout, case.process.stderr, encoding="utf-8", max_chars=3
+    )
+    case.process.communicate.assert_not_called()
+    capture.drain.assert_called_once()
+    capture.close.assert_called_once()
+    case.process.wait.assert_called_once()
+    assert case.owner.done.is_set()
+    assert sorted(fd for action, fd in case.events if action == "close") == [
+        _INIT_FD,
+        _LAUNCHER_FD,
+    ]
+    case.control.close.assert_called_once()
+    for stream in (case.process.stdin, case.process.stdout, case.process.stderr):
+        stream.close.assert_called_once()
+    retired_events = list(case.events)
+    case.owner.cancel()
+    assert case.events == retired_events
 
 
 @pytest.mark.parametrize("refusal", ["cancelled", "deadline", "init-exited", "launcher-exited"])
@@ -644,3 +763,175 @@ def test_init_identity_comes_from_kernel_fdinfo(
         with pytest.raises(OSError):
             request_control._pidfd_identity(_INIT_FD)
     assert paths == [f"/proc/self/fdinfo/{_INIT_FD}"]
+
+
+@dataclass
+class _LiveBwrapRequest:
+    owner: request_control.BwrapRequestControl
+    process: subprocess.Popen[bytes]
+    result: Future[request_control.BwrapRequestResult]
+    init_lifetime: int
+    launcher_lifetime: int
+    descendant_ready: Path
+
+
+@pytest.fixture
+def live_bwrap_request(tmp_path: Path, ending: str) -> Iterator[_LiveBwrapRequest]:
+    descendant_ready = tmp_path / "descendant-ready"
+    policy = SandboxPolicy(
+        backend_type="linux_bwrap",
+        active=True,
+        read_roots=None,
+        write_roots=[tmp_path],
+        write_files=[],
+        allow_network=False,
+        cwd_allow_hidden=[],
+        bind_host_proc=False,
+    )
+    owner = worker = process = None
+    observed_lifetimes: list[int] = []
+    with ExitStack() as resources:
+        parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        resources.enter_context(parent)
+        resources.enter_context(child)
+        parent.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+        parent.settimeout(10)
+        info = resources.enter_context(tempfile.TemporaryFile())
+        baseline = resources.enter_context(tempfile.TemporaryFile())
+        hardening = resources.enter_context(tempfile.TemporaryFile())
+        config = resources.enter_context(tempfile.TemporaryFile())
+        config.write(
+            json.dumps(
+                {
+                    "token": _TOKEN.decode("ascii"),
+                    "argv": detached_output_command(
+                        descendant_ready, ending, exit_code=7, ready_timeout=5
+                    ),
+                    "cwd": str(tmp_path),
+                    "env": {"PATH": os.defpath, "LANG": "C.UTF-8"},
+                }
+            ).encode()
+        )
+        config.flush()
+        config.seek(0)
+        descriptors = BwrapRequestFds(info.fileno(), baseline.fileno(), hardening.fileno())
+        argv = BwrapSandboxBackend().wrap_launcher_argv(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                Path(request_init.__file__).read_text(),
+                str(child.fileno()),
+                str(config.fileno()),
+            ],
+            policy,
+            tmp_path,
+            _request_fds=descriptors,
+        )
+        try:
+            process = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"PATH": os.defpath, "LANG": "C.UTF-8"},
+                pass_fds=(
+                    child.fileno(),
+                    config.fileno(),
+                    info.fileno(),
+                    baseline.fileno(),
+                    hardening.fileno(),
+                ),
+            )
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    resources.callback(stream.close)
+            child.close()
+            launcher_lifetime = os.pidfd_open(process.pid)
+            resources.callback(os.close, launcher_lifetime)
+            observed_lifetimes.append(launcher_lifetime)
+            if not select.select([parent], [], [], 10)[0]:
+                raise TimeoutError("Request init did not publish readiness")
+            info.seek(0)
+            init_pid = json.load(info)["child-pid"]
+            transferred_launcher = os.dup(launcher_lifetime)
+            try:
+                owner = request_control.BwrapRequestControl.receive(
+                    parent,
+                    process,
+                    _TOKEN,
+                    expected_init_pid=init_pid,
+                    launcher_pidfd=transferred_launcher,
+                )
+            except BaseException:
+                os.close(transferred_launcher)
+                raise
+            init_lifetime = os.dup(owner._init_pidfd)
+            resources.callback(os.close, init_lifetime)
+            observed_lifetimes.append(init_lifetime)
+            worker, result = _start_worker(
+                lambda: owner.run(deadline=time.monotonic() + 10), daemon=True
+            )
+            yield _LiveBwrapRequest(
+                owner, process, result, init_lifetime, launcher_lifetime, descendant_ready
+            )
+        except BaseException as error:
+            if owner is None and process is not None and process.poll() is not None:
+                stdout, stderr = process.communicate(timeout=1)
+                error.add_note(
+                    f"Request launcher exited {process.returncode}: "
+                    f"stdout={stdout[-2000:]!r}; stderr={stderr[-2000:]!r}"
+                )
+            raise
+        finally:
+            stalled_worker = False
+            try:
+                if owner is not None:
+                    with suppress(OSError):
+                        owner.cancel()
+                for descriptor in observed_lifetimes:
+                    with suppress(ProcessLookupError):
+                        signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                if worker is not None:
+                    worker.join(timeout=10)
+                    stalled_worker = worker.is_alive()
+                elif owner is not None:
+                    with suppress(request_control.RequestCancelled):
+                        owner.run(deadline=time.monotonic())
+            finally:
+                if process is not None:
+                    if not observed_lifetimes and process.poll() is None:
+                        process.kill()
+                    process.wait(timeout=10)
+            assert not stalled_worker, "Request worker stalled after pinned and launcher cleanup"
+
+
+@pytest.mark.skipif(shutil.which("bwrap", path=os.defpath) is None, reason="requires Bubblewrap")
+@pytest.mark.parametrize("ending", ["complete", "timeout", "cancel"])
+@pytest.mark.timeout(60)
+def test_real_request_retires_the_namespace_and_detached_output_holders(
+    live_bwrap_request: _LiveBwrapRequest, ending: str
+) -> None:
+    case = live_bwrap_request
+    poll_until(case.descendant_ready.exists, timeout_s=5, interval_s=0.01)
+    assert case.owner.admitted
+    if ending == "cancel":
+        assert not case.result.done()
+        case.owner.cancel()
+        with pytest.raises(request_control.RequestCancelled):
+            case.result.result(timeout=15)
+    else:
+        result = case.result.result(timeout=15)
+        assert result.timed_out == (ending == "timeout")
+        assert result.exit_code == (7 if ending == "complete" else None)
+        assert result.stdout == (
+            b"descendant-ready\ncommand-complete\n"
+            if ending == "complete"
+            else b"descendant-ready\n"
+        )
+        assert b"descendant-stderr\n" in result.stderr
+    assert case.owner.done.is_set()
+    assert case.process.poll() is not None
+    assert request_control._pidfd_exited(case.init_lifetime)
+    assert request_control._pidfd_exited(case.launcher_lifetime)

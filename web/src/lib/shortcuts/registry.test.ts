@@ -20,6 +20,7 @@ import {
   type ShortcutId,
   type ShortcutPageContext,
   shortcutRowKeys,
+  shortcutShownKeys,
   WORKSPACE_SIDEBAR_BINDINGS,
 } from "./registry";
 
@@ -298,6 +299,26 @@ describe("shortcut registry", () => {
     expect(matchesShortcut(comma, "settings.open", { ...mac, desktopMenu: true })).toBe(false);
   });
 
+  it("leaves ⌘[ / ⌘] to the menu only on a shell that routes Go, which came after the bridge", () => {
+    const back = press({ key: "[", code: "BracketLeft", metaKey: true });
+    const bridgeWithoutGo = { ...mac, native: true, desktopMenu: true, goMenu: false };
+    expect(matchesShortcut(back, "history.back", bridgeWithoutGo)).toBe(true);
+    expect(menuShortcutChords("history.back", bridgeWithoutGo)).toEqual([]);
+    const goMenu = { ...bridgeWithoutGo, goMenu: true };
+    expect(matchesShortcut(back, "history.back", goMenu)).toBe(false);
+    expect(menuShortcutChords("history.forward", goMenu)).toEqual([
+      { mod: true, code: "BracketRight" },
+    ]);
+    expect(shortcutShownKeys("history.back", currentShortcutEnvironment(goMenu))).toEqual([
+      "⌘",
+      "[",
+    ]);
+    expect(shortcutShownKeys("history.back", currentShortcutEnvironment(bridgeWithoutGo))).toEqual([
+      "⌘",
+      "[",
+    ]);
+  });
+
   it("never matches AltGr, which reports as Control+Alt", () => {
     const altGraph = press({
       key: "r",
@@ -386,14 +407,17 @@ describe("General and Navigation bindings", () => {
     }
   });
 
-  it("numbers sidebar sessions ⌘1–⌘9 then ⌘0, adding Alt in a browser", () => {
+  it("numbers sidebar sessions ⌘1–⌘9, leaving ⌘0 to Actual Size, adding Alt in a browser", () => {
     const native = { ...mac, native: true };
     expect(
       matchedShortcutChordIndex(press({ key: "1", metaKey: true }), "session.number", native),
     ).toBe(0);
     expect(
+      matchedShortcutChordIndex(press({ key: "9", metaKey: true }), "session.number", native),
+    ).toBe(8);
+    expect(
       matchedShortcutChordIndex(press({ key: "0", metaKey: true }), "session.number", native),
-    ).toBe(9);
+    ).toBe(-1);
     expect(
       matchedShortcutChordIndex(press({ key: "1", metaKey: true }), "session.number", mac),
     ).toBe(-1);
@@ -661,13 +685,14 @@ describe("Keyboard shortcuts page metadata", () => {
     siblingSessions: false,
     desktopCommands: false,
     alwaysSteer: false,
+    quickPick: false,
   };
   const resolved = (environment: Partial<ShortcutEnvironment>) =>
     currentShortcutEnvironment({ submitWithModEnter: false, ...environment });
 
   it("shows a numbered binding's row as a range of digits", () => {
     const native = resolved({ mac: true, native: true, desktopMenu: false });
-    expect(shortcutRowKeys("session.number", native, page)).toEqual(["⌘", "1…0"]);
+    expect(shortcutRowKeys("session.number", native, page)).toEqual(["⌘", "1…9"]);
     expect(shortcutRowKeys("workspace.tab", resolved(mac), page)).toEqual(["⌃", "1…4"]);
     expect(
       shortcutRowKeys("workspace.tab", resolved(mac), { ...page, contentSearch: true }),
